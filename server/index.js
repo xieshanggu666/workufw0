@@ -7,7 +7,8 @@ import {
   listQuotas, listAlerts, getAdjustments, activeAlertCount
 } from './quota.js'
 import {
-  initFamily, getMemberByToken, listFamily, can,
+  initFamily, getMemberByToken, getActiveMemberById, listFamily, can, deviceInScope, roomInScope,
+  scopeDeniedMessage,
   createInvite, acceptInvite, previewInvite, cancelInvite, resendInvite,
   updateMember, revokeMember, restoreMember, reinviteMember, ROLE_LABEL, PERMISSIONS
 } from './family.js'
@@ -82,6 +83,57 @@ function requirePerm(perm) {
   }
 }
 
+// ===== 细粒度授权：在功能权限通过后，再校验操作对象是否落在该成员的房间/设备范围内 =====
+// 越权拦截同样写家庭日志（operator=被拦截人），保留操作审计；户主/管理员全屋不限。
+function denyScope(req, res, label, action = '越权操作拦截', extra = {}) {
+  log(extra.device || '🔒', action, `${ROLE_LABEL[req.member.role]}「${req.member.name}」尝试操作授权范围外对象：${label}`,
+    { category: extra.category || 'member' })
+  return res.status(403).json({ error: scopeDeniedMessage(label), no_perm: true, out_of_scope: true })
+}
+// 设备维度：按设备 id 取设备后判定；设备不存在由原路由处理 404
+function ensureDeviceScope(req, res, device) {
+  if (deviceInScope(req.member, device)) return true
+  return !denyScope(req, res, `${device.name}（${q1('SELECT name FROM rooms WHERE id=?', device.room_id)?.name || '未知房间'}）`,
+    '越权设备操作拦截', { device: device.name }) && false
+}
+// 房间维度
+function ensureRoomScope(req, res, roomId, roomName) {
+  if (roomInScope(req.member, roomId)) return true
+  denyScope(req, res, roomName || `房间#${roomId}`, '越权房间操作拦截', { device: roomName || `房间#${roomId}` })
+  return false
+}
+// 定额对象：scope=room 判房间，scope=device 判设备（按稳定 device_id；设备删除则按其历史房间无从判定，仅定额主人可处理）
+function quotaWithinMemberScope(member, quota) {
+  if (quota.scope === 'room') return roomInScope(member, quota.room_id)
+  const d = quota.device_id ? q1('SELECT * FROM devices WHERE id=?', quota.device_id) : null
+  if (d) return deviceInScope(member, d)
+  // 设备已删除的设备定额：房间推断已失效，仅全屋不限身份或仍显式持有该 device_id 授权者可操作
+  const scope = safeParseScope(member.scope)
+  return scope.all || scope.device_ids.includes(Number(quota.device_id))
+}
+function ensureQuotaScope(req, res, quota) {
+  if (quotaWithinMemberScope(req.member, quota)) return true
+  const tail = quota.scope === 'device' && !q1('SELECT id FROM devices WHERE id=?', quota.device_id) ? '（设备已删除）' : ''
+  denyScope(req, res, `${quota.scope === 'room' ? '房间' : '设备'}定额「${quota.target_name}」${tail}`,
+    '越权定额操作拦截', { device: '定额', category: 'quota' })
+  return false
+}
+// 解析成员 scope（与 family.parseScope 同构，路由层只做只读判定，避免再导出内部函数）
+function safeParseScope(raw) {
+  try {
+    const v = JSON.parse(raw || '{}')
+    const roomIds = Array.isArray(v?.room_ids) ? v.room_ids.map(Number) : []
+    const deviceIds = Array.isArray(v?.device_ids) ? v.device_ids.map(Number) : []
+    return { room_ids: roomIds, device_ids: deviceIds, all: !roomIds.length && !deviceIds.length }
+  } catch { return { room_ids: [], device_ids: [], all: true } }
+}
+// 工单对象范围：设备类工单按设备当前房间/稳定 id 判定；超标工单按其定额对象判定
+function ensureWorkOrderScope(req, res, wo) {
+  if (workOrderWithinMemberScope(req.member, wo)) return true
+  denyScope(req, res, `工单 ${wo.code} · ${wo.target_name}`, '越权工单操作拦截', { device: '🎫', category: 'workorder' })
+  return false
+}
+
 // ===== 状态聚合 =====
 app.get('/api/state', (req, res) => {
   // 拉取前先校准一次工单：设备状态刚被改写（开关/删除/改名）或定额刚评估完时，
@@ -91,33 +143,70 @@ app.get('/api/state', (req, res) => {
   res.json({
     current: req.member ? {
       id: req.member.id, name: req.member.name, role: req.member.role,
-      role_label: ROLE_LABEL[req.member.role], token: req.member.token
+      role_label: ROLE_LABEL[req.member.role], token: req.member.token,
+      scope_all: req.member.role === 'owner' || req.member.role === 'admin' ||
+        (() => { const sc = safeParseScope(req.member.scope); return sc.all })()
     } : null,
     family: listFamily(),
     rooms: q('SELECT * FROM rooms'),
     types: q('SELECT * FROM device_types'),
     devices: q(`SELECT d.*, r.name room, t.name type_name, t.icon type_icon
-                FROM devices d JOIN rooms r ON r.id=d.room_id JOIN device_types t ON t.id=d.type_id`),
+                FROM devices d JOIN rooms r ON r.id=d.room_id JOIN device_types t ON t.id=d.type_id`)
+      .map((d) => ({ ...d, in_scope: req.member ? deviceInScope(req.member, d) : false })),
     scenes: q('SELECT * FROM scenes').map((s) => {
-      const actions = q(`SELECT sa.id, sa.device_id, sa.device_key, sa.action, d.name device_name,
+      const actions = q(`SELECT sa.id, sa.device_id, sa.device_key, sa.action, d.name device_name, d.room_id droom,
                                 (SELECT COUNT(*) FROM devices x WHERE x.name=sa.device_key) key_match_count
                          FROM scene_actions sa LEFT JOIN devices d ON d.id=sa.device_id
                          WHERE sa.scene_id=? ORDER BY sa.order_no, sa.id`, s.id)
         .map((a) => ({
           ...a,
           // device_id 为空时区分原因：同名设备不止一台=迁移时无法判定归属，需人工重新绑定；否则为设备已删除
-          unresolved: !a.device_name ? (a.key_match_count > 1 ? 'duplicate' : 'missing') : null
+          unresolved: !a.device_name ? (a.key_match_count > 1 ? 'duplicate' : 'missing') : null,
+          // 每个动作设备是否在当前身份授权范围内（前端置灰提示；执行时后端整单复核）
+          in_scope: !a.device_id || !req.member ? null
+            : deviceInScope(req.member, { id: a.device_id, room_id: a.droom })
         }))
-      return { ...s, action_count: actions.length, actions }
+      // 场景可执行 = 全部已绑定设备都在范围内（有任一越界设备则整单会被后端拒绝，按钮直接置灰）
+      const outOfScopeDevices = req.member
+        ? actions.filter((a) => a.device_id && a.in_scope === false).map((a) => a.device_name)
+        : []
+      return {
+        ...s, action_count: actions.length, actions,
+        in_scope: !req.member ? null : outOfScopeDevices.length === 0,
+        out_of_scope_devices: [...new Set(outOfScopeDevices)]
+      }
     }),
     logs: q('SELECT * FROM device_logs ORDER BY id DESC LIMIT 50'),
     energy,
-    quotas: listQuotas(),
-    quota_alerts: listAlerts(),
-    work_orders: listWorkOrders(),
+    quotas: listQuotas().map((qt) => ({ ...qt, in_scope: req.member ? quotaWithinMemberScope(req.member, qt) : false })),
+    quota_alerts: listAlerts().map((al) => {
+      const qt = q1('SELECT q.* FROM energy_quotas q JOIN quota_alerts a ON a.quota_id=q.id WHERE a.id=?', al.id)
+      return { ...al, in_scope: req.member && qt ? quotaWithinMemberScope(req.member, qt) : (req.member ? true : false) }
+    }),
+    work_orders: listWorkOrders().map((wo) => ({
+      ...wo,
+      in_scope: req.member ? workOrderWithinMemberScope(req.member, wo) : false
+    })),
     alerts: computeAlerts(energy)
   })
 })
+
+// 工单范围纯判定（供 /api/state 标记与操作路由共用）
+function workOrderWithinMemberScope(member, wo) {
+  if (wo.device_id != null) {
+    const d = q1('SELECT * FROM devices WHERE id=?', wo.device_id)
+    if (!d) {
+      const sc = safeParseScope(member.scope)
+      return sc.all || sc.device_ids.includes(Number(wo.device_id))
+    }
+    return deviceInScope(member, d)
+  }
+  if (wo.quota_alert_id != null) {
+    const qt = q1('SELECT q.* FROM energy_quotas q JOIN quota_alerts a ON a.quota_id=q.id WHERE a.id=?', wo.quota_alert_id)
+    return !qt || quotaWithinMemberScope(member, qt)
+  }
+  return true
+}
 
 function computeAlerts(energy) {
   const devs = q('SELECT * FROM devices')
@@ -164,13 +253,18 @@ function computeAlerts(energy) {
 app.post('/api/device', requirePerm('device_control'), (req, res) => {
   const { name, type_id, room_id } = req.body
   if (!name || !type_id || !room_id) return res.status(400).json({ error: 'missing' })
+  // 新增设备落到哪个房间，就需要该房间在操作范围内
+  const room = q1('SELECT * FROM rooms WHERE id=?', room_id)
+  if (!room) return res.status(400).json({ error: '房间不存在' })
+  if (!ensureRoomScope(req, res, room.id, room.name)) return
   const r = run('INSERT INTO devices (name,type_id,room_id) VALUES (?,?,?)', name, type_id, room_id)
-  log(name, '新增设备', `房间 ${q1('SELECT name FROM rooms WHERE id=?', room_id).name}`)
+  log(name, '新增设备', `房间 ${room.name}`)
   res.json({ ok: true, id: r.lastInsertRowid })
 })
 app.delete('/api/device/:id', requirePerm('device_control'), (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
+  if (!ensureDeviceScope(req, res, d)) return
   // 引用该设备的场景动作将随外键 ON DELETE SET NULL 置空（失效引用）
   const affected = q1('SELECT COUNT(*) c FROM scene_actions WHERE device_id=?', d.id).c
   // 先结落未结用电段（历史记录保留），再删除设备
@@ -185,6 +279,7 @@ app.delete('/api/device/:id', requirePerm('device_control'), (req, res) => {
 app.post('/api/device/:id/toggle', requirePerm('device_control'), (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
+  if (!ensureDeviceScope(req, res, d)) return
   if (d.status === 'error') return res.status(409).json({ error: '设备异常，无法操作' })
   const on = d.power_on ? 0 : 1
   run('UPDATE devices SET power_on=? WHERE id=?', on, d.id)
@@ -198,6 +293,7 @@ app.post('/api/device/:id/toggle', requirePerm('device_control'), (req, res) => 
 app.post('/api/device/:id/update', requirePerm('device_control'), (req, res) => {
   const d = q1('SELECT * FROM devices WHERE id=?', req.params.id)
   if (!d) return res.status(404).json({ error: 'not found' })
+  if (!ensureDeviceScope(req, res, d)) return
   const { name, room_id, watts, power_on } = req.body
   if (room_id != null && !q1('SELECT id FROM rooms WHERE id=?', room_id))
     return res.status(400).json({ error: '房间不存在' })
@@ -205,6 +301,11 @@ app.post('/api/device/:id/update', requirePerm('device_control'), (req, res) => 
     return res.status(400).json({ error: '功率需为 0-10000 的数字' })
   const nextName = (name ?? d.name).toString()
   const nextRoom = room_id ?? d.room_id
+  // 换房：目标房间同样要在操作范围内——不能借「换房」把设备挪出自己的授权区域
+  if (nextRoom !== d.room_id) {
+    const target = q1('SELECT name FROM rooms WHERE id=?', nextRoom)
+    if (!target || !ensureRoomScope(req, res, nextRoom, target.name)) return
+  }
   const nextWatts = watts ?? d.watts
   const nextOn = power_on ?? d.power_on
   run('UPDATE devices SET name=?, room_id=?, watts=?, power_on=? WHERE id=?',
@@ -219,7 +320,11 @@ app.post('/api/device/:id/update', requirePerm('device_control'), (req, res) => 
   }
   const detail = []
   if (nextName !== d.name) detail.push(`改名「${d.name}」→「${nextName}」`)
-  if (nextRoom !== d.room_id) detail.push(`换到 ${q1('SELECT name FROM rooms WHERE id=?', nextRoom).name}`)
+  if (nextRoom !== d.room_id) {
+    const oldRoom = q1('SELECT name FROM rooms WHERE id=?', d.room_id)?.name
+    const newRoom = q1('SELECT name FROM rooms WHERE id=?', nextRoom)?.name
+    detail.push(`换房「${oldRoom || '—'}」→「${newRoom || '—'}」（按房间授予的成员授权随设备迁入/迁出自动迁移，按设备授予的授权按设备稳定保留）`)
+  }
   if (nextWatts !== d.watts) detail.push(`功率 ${d.watts}W→${nextWatts}W`)
   if (nextOn !== d.power_on) detail.push(nextOn ? '已开启' : '已关闭')
   log(nextName, '更新设备', detail.join('，'))
@@ -230,9 +335,17 @@ app.post('/api/device/:id/update', requirePerm('device_control'), (req, res) => 
 app.post('/api/scene', requirePerm('scene_manage'), (req, res) => {
   const { name, actions } = req.body
   const list = Array.isArray(actions) ? actions : []
+  // 编排场景：每个动作引用的设备都必须存在且在编排人的授权范围内，
+  // 否则可借场景间接控制范围外设备（场景执行的统一校验口径见 /run）
+  const outOfScope = []
   for (const a of list) {
-    if (!q1('SELECT id FROM devices WHERE id=?', a.device_id))
-      return res.status(400).json({ error: `动作引用了不存在的设备（ID ${a.device_id}）` })
+    const d = q1('SELECT * FROM devices WHERE id=?', a.device_id)
+    if (!d) return res.status(400).json({ error: `动作引用了不存在的设备（ID ${a.device_id}）` })
+    if (!deviceInScope(req.member, d)) outOfScope.push(d.name)
+  }
+  if (outOfScope.length) {
+    log('🎬', '越权场景编排拦截', `「${name || '新场景'}」包含授权范围外设备：${outOfScope.join('、')}`, { category: 'scene' })
+    return res.status(403).json({ error: `以下设备不在你的授权房间/设备范围内，无法编入场景：${outOfScope.join('、')}`, no_perm: true, out_of_scope: true })
   }
   const r = run('INSERT INTO scenes (name,desc,enabled) VALUES (?,?,1)', name || '新场景', '')
   const act = db.prepare('INSERT INTO scene_actions (scene_id,device_id,device_key,action,order_no) VALUES (?,?,?,?,?)')
@@ -264,10 +377,24 @@ app.post('/api/scene/:id/run', requirePerm('scene_execute'), (req, res) => {
   const s = q1('SELECT * FROM scenes WHERE id=?', req.params.id)
   if (!s) return res.status(404).json({ error: 'not found' })
   if (!s.enabled) return res.status(409).json({ error: '场景已停用，无法执行' })
-  const actions = q(`SELECT sa.*, d.id did, d.name dname, d.status dstatus,
+  const actions = q(`SELECT sa.*, d.id did, d.name dname, d.status dstatus, d.room_id droom,
                             (SELECT COUNT(*) FROM devices x WHERE x.name=sa.device_key) key_match_count
                      FROM scene_actions sa LEFT JOIN devices d ON d.id=sa.device_id
                      WHERE sa.scene_id=? ORDER BY sa.order_no, sa.id`, s.id)
+  // 统一范围校验：场景里只要有一个已绑定设备超出触发人的授权房间/设备范围，整单拒绝执行
+  // （绝不只跳过越权动作后悄悄执行其余部分——那样可借场景越权联动）。
+  // 设备换房后这里按最新 room_id 判定，房间授权随设备迁移自动生效/失效，无需改写场景。
+  const outOfScope = actions
+    .filter((a) => a.did && !deviceInScope(req.member, { id: a.did, room_id: a.droom }))
+    .map((a) => a.dname)
+  if (outOfScope.length) {
+    log('🎬', `场景「${s.name}」越权执行拦截`,
+      `包含授权范围外设备：${[...new Set(outOfScope)].join('、')}`, { category: 'scene' })
+    return res.status(403).json({
+      error: `场景包含不在你授权房间/设备范围内的设备（${[...new Set(outOfScope)].join('、')}），整单未执行，请联系管理员调整授权`,
+      no_perm: true, out_of_scope: true, out_of_scope_devices: [...new Set(outOfScope)]
+    })
+  }
   const executed = [], failed = []
   const changed = new Set()
   const batchAt = new Date()
@@ -304,6 +431,16 @@ app.post('/api/scene/:id/run', requirePerm('scene_execute'), (req, res) => {
 // 额度配置（按房间/设备 × 日/周/月）；同一对象同一周期唯一
 app.post('/api/quota', requirePerm('quota_manage'), (req, res) => {
   try {
+    // 新建定额的对象必须在配置人的授权范围内
+    if (req.body.scope === 'room') {
+      const room = q1('SELECT name FROM rooms WHERE id=?', req.body.room_id)
+      if (!room) return res.status(400).json({ error: '房间不存在' })
+      if (!ensureRoomScope(req, res, req.body.room_id, room.name)) return
+    } else if (req.body.scope === 'device') {
+      const d = q1('SELECT * FROM devices WHERE id=?', req.body.device_id)
+      if (!d) return res.status(400).json({ error: '设备不存在' })
+      if (!ensureDeviceScope(req, res, d)) return
+    }
     const id = createQuota(req.body || {})
     log('定额', '新增定额',
       `${req.body.scope === 'room' ? '房间' : '设备'}定额已配置，周期 ${req.body.period}，额度 ${Number(req.body.limit_kwh)}kWh`,
@@ -313,6 +450,9 @@ app.post('/api/quota', requirePerm('quota_manage'), (req, res) => {
 })
 app.post('/api/quota/:id/update', requirePerm('quota_manage'), (req, res) => {
   try {
+    const before = q1('SELECT * FROM energy_quotas WHERE id=?', req.params.id)
+    if (!before) return res.status(404).json({ error: '定额不存在' })
+    if (!ensureQuotaScope(req, res, before)) return
     const changes = updateQuota(Number(req.params.id), req.body || {})
     const q0 = q1('SELECT * FROM energy_quotas WHERE id=?', req.params.id)
     log('定额', '调整定额',
@@ -325,8 +465,10 @@ app.post('/api/quota/:id/update', requirePerm('quota_manage'), (req, res) => {
 app.delete('/api/quota/:id', requirePerm('quota_manage'), (req, res) => {
   try {
     const q0 = q1('SELECT * FROM energy_quotas WHERE id=?', req.params.id)
+    if (!q0) return res.status(404).json({ error: '定额不存在' })
+    if (!ensureQuotaScope(req, res, q0)) return
     deleteQuota(Number(req.params.id), req.body?.reason || '')
-    if (q0) log('定额', '删除定额', `「${q0.target_name}」${q0.period} 定额已删除，未关闭告警自动解除`, { category: 'quota' })
+    log('定额', '删除定额', `「${q0.target_name}」${q0.period} 定额已删除，未关闭告警自动解除`, { category: 'quota' })
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
@@ -339,7 +481,35 @@ const BATCH_ACTION_LABEL = {
 }
 app.post('/api/quota/batch', requirePerm('quota_manage'), (req, res) => {
   try {
-    const { results, applied, failed } = applyBatchQuota(req.body || {})
+    // 批量范围预检：任一对象超出操作人授权范围则整批拒绝（在单事务落库之前拦截，不产生部分写入）
+    const body = req.body || {}
+    if (body.action === 'create') {
+      const out = []
+      for (const t of (Array.isArray(body.targets) ? body.targets : [])) {
+        if (t.scope === 'room') {
+          const room = q1('SELECT name FROM rooms WHERE id=?', Number(t.room_id))
+          if (room && !roomInScope(req.member, room.id)) out.push(`房间·${room.name}`)
+        } else {
+          const d = q1('SELECT * FROM devices WHERE id=?', Number(t.device_id))
+          if (d && !deviceInScope(req.member, d)) out.push(`设备·${d.name}`)
+        }
+      }
+      if (out.length) {
+        denyScope(req, res, `${out.join('、')}（共 ${out.length} 项）`, '越权批量定额拦截', { device: '定额', category: 'quota' })
+        return
+      }
+    } else if (Array.isArray(body.quota_ids)) {
+      const out = []
+      for (const id of body.quota_ids) {
+        const q0 = q1('SELECT * FROM energy_quotas WHERE id=?', Number(id))
+        if (q0 && !quotaWithinMemberScope(req.member, q0)) out.push(`${q0.scope === 'room' ? '房间' : '设备'}·${q0.target_name}`)
+      }
+      if (out.length) {
+        denyScope(req, res, `${out.join('、')}（共 ${out.length} 条）`, '越权批量定额拦截', { device: '定额', category: 'quota' })
+        return
+      }
+    }
+    const { results, applied, failed } = applyBatchQuota(body)
     const skipped = results.filter((r) => r.skipped).length
     const fails = results.filter((r) => !r.ok).map((r) => `${r.label}（${r.message}）`).join('；')
     log('定额', BATCH_ACTION_LABEL[req.body?.action] || '批量定额操作',
@@ -351,12 +521,19 @@ app.post('/api/quota/batch', requirePerm('quota_manage'), (req, res) => {
     res.json({ ok: failed === 0, applied, failed, results })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
+// 通过告警 id 反查其定额对象（scope 判定用）；告警必须挂在现存定额上
+function quotaByAlertId(alertId) {
+  return q1(`SELECT q.* FROM energy_quotas q
+             JOIN quota_alerts a ON a.quota_id=q.id WHERE a.id=?`, Number(alertId))
+}
 // 告警处理闭环：待处理 → 处理中 → 已处理/已忽略，可附处理备注
 app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req, res) => {
   try {
     const { status, note } = req.body || {}
     const a0 = q1('SELECT * FROM quota_alerts WHERE id=?', req.params.id)
     if (!a0) return res.status(404).json({ error: '告警不存在' })
+    const quota = quotaByAlertId(req.params.id)
+    if (quota && !ensureQuotaScope(req, res, quota)) return
     const a = handleAlert(Number(req.params.id), { status, note })
     const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: a0.status === 'handling' ? '退回待处理' : '重新打开' }[status] || '更新状态'
     const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }[a.period] || a.period
@@ -371,6 +548,18 @@ app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req,
 app.post('/api/quota-alert/batch-handle', requirePerm('quota_alert_handle'), (req, res) => {
   try {
     const { ids, status, note } = req.body || {}
+    // 批量预检：任一条告警对应定额超出范围则整批拒绝（不在事务里，先于逐条状态机校验）
+    const list = Array.isArray(ids) ? ids : []
+    const out = []
+    for (const id of list) {
+      const q0 = quotaByAlertId(id)
+      if (q0 && !quotaWithinMemberScope(req.member, q0)) out.push(`${q0.scope === 'room' ? '房间' : '设备'}·${q0.target_name}`)
+    }
+    if (out.length) {
+      denyScope(req, res, `${[...new Set(out)].join('、')}（共 ${out.length} 条告警）`,
+        '越权批量告警处理拦截', { device: '定额', category: 'quota' })
+      return
+    }
     const { results, applied, failed } = batchHandleAlerts(ids, { status, note })
     const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: '重新打开/退回' }[status] || '更新状态'
     const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }
@@ -408,6 +597,17 @@ app.post('/api/work-order/:id/operate', (req, res) => {
   try {
     const before = q1('SELECT * FROM work_orders WHERE id=?', req.params.id)
     if (!before) return res.status(404).json({ error: '工单不存在' })
+    // 工单与设备/设备定额同源：分派与处理都必须在工单对象的授权范围内
+    if (!ensureWorkOrderScope(req, res, before)) return
+    // 分派/改派：被分派人必须在组、持有工单处理权限，且其授权范围覆盖该工单对象
+    if (action === 'dispatch') {
+      const assignee = getActiveMemberById(assignee_id)
+      if (!assignee) return res.status(400).json({ error: '请选择有效的在组成员作为处理人' })
+      if (!can(assignee, 'workorder_handle'))
+        return res.status(400).json({ error: `「${assignee.name}」没有工单处理权限，不能被分派` })
+      if (!workOrderWithinMemberScope(assignee, before))
+        return res.status(400).json({ error: `「${assignee.name}」的授权房间/设备范围不覆盖该工单对象，请先调整其操作范围` })
+    }
     // operateWorkOrder 内成员对象需要角色中文标签写事件时间线
     const actor = { ...req.member, role_label: ROLE_LABEL[req.member.role] }
     const wo = operateWorkOrder(Number(req.params.id), action, actor, { assignee_id, note })

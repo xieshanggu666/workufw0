@@ -2,6 +2,7 @@
   <div class="scenes">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：访客/成员加入家庭后可触发场景，场景编排需「场景管理」权限。</div>
     <div v-else-if="!canRun" class="lock-banner">🔒 当前角色没有场景执行权限，仅可查看场景。</div>
+    <div v-else-if="!store.scopeAll" class="lock-banner scope">🎯 你的场景执行已限定授权房间/设备；含范围外设备的场景整单不可触发（后端统一拦截），设备换房后可执行性自动重算。</div>
     <div class="toolbar">
       <button class="add" :disabled="!canManage" :title="canManage?'':'无场景管理权限'" @click="canManage && (showBuilder = !showBuilder)">＋ 新建场景</button>
     </div>
@@ -12,8 +13,10 @@
       <input v-model="sceneForm.name" placeholder="场景名称，如 观影模式" required />
       <p class="hint">为场景添加「设备 → 动作」步骤：</p>
       <div class="step" v-for="(s,i) in sceneForm.actions" :key="i">
-        <select v-model="s.device_id">
-          <option v-for="d in store.devices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}</option>
+        <select v-model="s.device_id" :class="{oos: store.current && !deviceInStoreScope(s.device_id)}">
+          <option v-for="d in store.devices" :key="d.id" :value="d.id" :disabled="store.current && !d.in_scope">
+            {{ d.type_icon }} {{ d.name }}（{{ d.room }}）{{ store.current && !d.in_scope ? '·范围外' : '' }}
+          </option>
         </select>
         <select v-model="s.action"><option>开启</option><option>关闭</option><option>调节亮度</option><option>布防</option><option>启动</option></select>
         <button type="button" class="rm" @click="sceneForm.actions.splice(i,1)">✕</button>
@@ -45,14 +48,19 @@
           <span class="badge" :class="s.enabled?'on':'off'">{{ s.enabled?'已启用':'已停用' }}</span>
         </div>
         <div class="actions">
-          <div v-for="a in s.actions" :key="a.id" class="act-chip" :class="{invalid:!a.device_name}">
-            <span class="k">{{ a.device_name || a.device_key || '未知设备' }}<em v-if="!a.device_name">{{ a.unresolved === 'duplicate' ? '重名·待重新绑定' : '已删除' }}</em></span>
+          <div v-for="a in s.actions" :key="a.id" class="act-chip"
+               :class="{invalid:!a.device_name, oos: a.device_name && store.current && a.in_scope===false}">
+            <span class="k">{{ a.device_name || a.device_key || '未知设备' }}<em v-if="!a.device_name">{{ a.unresolved === 'duplicate' ? '重名·待重新绑定' : '已删除' }}</em><em v-else-if="store.current && a.in_scope===false" class="oos-em">🎯范围外</em></span>
             <span class="v">{{ a.action }}</span>
           </div>
           <span v-if="!s.actions.length" class="noact">无动作</span>
         </div>
+        <div v-if="store.current && canRun && !store.sceneInScope(s)" class="scope-note">
+          🎯 含范围外设备（{{ s.out_of_scope_devices.join('、') }}），整单不可触发
+        </div>
         <div class="btns">
-          <button class="run" :disabled="!s.enabled || !canRun" :title="canRun?'':'无场景执行权限'" @click="canRun && run(s)">▶ 触发</button>
+          <button class="run" :disabled="!s.enabled || !canRun || !store.sceneInScope(s)"
+                  :title="!canRun?'无场景执行权限':(!store.sceneInScope(s)?'包含授权范围外设备':'')" @click="canRun && store.sceneInScope(s) && run(s)">▶ 触发</button>
           <button v-if="canManage" class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
           <button v-if="canManage" class="ghost del" @click="remove(s)">删除</button>
         </div>
@@ -71,6 +79,11 @@ const canManage = computed(() => store.can('scene_manage'))
 const showBuilder = ref(false)
 const sceneForm = ref({ name: '', actions: [] })
 const lastResult = ref(null)
+// 构编器下拉中设备是否在当前身份授权范围（scope_all 时设备无 in_scope=false）
+function deviceInStoreScope(id) {
+  const d = store.devices.find((x) => x.id === Number(id))
+  return !store.current || !d || d.in_scope !== false
+}
 
 function create() {
   const actions = sceneForm.value.actions.filter((a) => a.device_id != null)
@@ -91,6 +104,11 @@ async function remove(s) {
 <style scoped>
 .scenes{display:flex;flex-direction:column;gap:12px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope{background:#12291a;border-color:rgba(102,187,106,.35);color:#a5d6a7;}
+.scope-note{font-size:10px;color:#ef9a9a;margin:2px 0 6px;}
+.act-chip.oos{border-color:rgba(239,154,158,.4);}
+.oos-em{color:#ef9a9a !important;}
+.step select.oos{border-color:rgba(239,154,158,.5);}
 .toolbar button{font-family:inherit;background:linear-gradient(135deg,#43a047,#2e7d32);border:none;color:#fff;border-radius:8px;padding:9px 14px;font-size:13px;font-weight:600;cursor:pointer;}
 .builder{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px;}
 .builder h4{margin:0;color:#fff;}

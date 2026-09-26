@@ -61,7 +61,13 @@ export const useHomeStore = defineStore('home', {
     pendingInvites: (s) => s.family.invites.filter((i) => i.status === 'pending'),
     // 当前身份是否具备某权限（后端会再次强制校验，前端仅用于按钮置灰等交互）
     can: (s) => (perm) => !!s.current && (s.current.effective_perms || []).includes(perm),
-    isManager: (s) => !!s.current && (s.current.effective_perms || []).includes('member_manage')
+    isManager: (s) => !!s.current && (s.current.effective_perms || []).includes('member_manage'),
+    // 当前身份是否全屋不限（户主/管理员或未限定范围）
+    scopeAll: (s) => !s.current || s.current.scope_all !== false,
+    // 设备是否在当前身份授权范围内（浏览模式不判定，交由原有的登录校验置灰）
+    deviceInScope: (s) => (device) => !s.current || !!device?.in_scope,
+    // 场景是否全部动作都在范围内（有越界设备时整单不可触发）
+    sceneInScope: (s) => (scene) => !s.current || scene?.in_scope !== false
   },
   actions: {
     async load() {

@@ -2,6 +2,7 @@
   <div class="wo">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：加入家庭后可处理工单；家庭成员默认可接单/处理/完成，分派与改派需管理权限。</div>
     <div v-else-if="!canDispatch && !canHandle" class="lock-banner">🔒 当前角色没有工单相关操作权限，仅可查看工单。</div>
+    <div v-else-if="!store.scopeAll" class="lock-banner scope">🎯 你的工单操作已限定授权房间/设备：范围外工单仅可查看，分派/接单/处理由后端统一拦截。</div>
 
     <!-- KPI -->
     <div class="kpis">
@@ -40,6 +41,7 @@
               <span class="src">{{ w.source_icon }} {{ w.source_label }}</span>
               <span class="target">{{ w.target_name }}</span>
               <i v-if="w.device_deleted" class="tag del">设备已删除</i>
+              <i v-if="store.current && !w.in_scope" class="tag scope">🎯 范围外</i>
             </td>
             <td><span class="lv" :class="w.level">{{ w.level==='error'?'紧急':'一般' }}</span></td>
             <td><span class="st" :class="w.status">{{ w.status_label }}</span></td>
@@ -57,29 +59,29 @@
             </td>
             <td class="dim">{{ fmtTime(w.created_at) }}</td>
             <td class="ops" @click.stop>
-              <template v-if="canDispatch && ['open','reopened','dispatched','accepted','processing','suspended'].includes(w.status)">
+              <template v-if="canDispatch && w.in_scope!==false && ['open','reopened','dispatched','accepted','processing','suspended'].includes(w.status)">
                 <button class="go" @click="openDispatch(w)">
                   {{ ['dispatched','accepted','processing','suspended'].includes(w.status) ? '改派' : '分派' }}
                 </button>
               </template>
-              <template v-if="canHandle && w.status==='dispatched' && isMine(w)">
+              <template v-if="canHandle && w.in_scope!==false && w.status==='dispatched' && isMine(w)">
                 <button class="ok-btn" @click="act(w,'accept')">接单</button>
               </template>
-              <template v-if="canHandle && w.status==='accepted' && isMine(w)">
+              <template v-if="canHandle && w.in_scope!==false && w.status==='accepted' && isMine(w)">
                 <button class="go" @click="act(w,'start')">开始处理</button>
               </template>
-              <template v-if="canHandle && w.status==='processing' && isMine(w)">
+              <template v-if="canHandle && w.in_scope!==false && w.status==='processing' && isMine(w)">
                 <button class="susp" @click="act(w,'suspend')">挂起</button>
                 <button class="ok-btn" @click="act(w,'complete')">完成</button>
               </template>
-              <template v-if="canHandle && w.status==='suspended' && isMine(w)">
+              <template v-if="canHandle && w.in_scope!==false && w.status==='suspended' && isMine(w)">
                 <button class="go" @click="act(w,'resume')">继续</button>
                 <button class="ok-btn" @click="act(w,'complete')">完成</button>
               </template>
-              <template v-if="canHandle && w.status==='completed' && w.source_active">
+              <template v-if="canHandle && w.in_scope!==false && w.status==='completed' && w.source_active">
                 <button class="reopen" @click="act(w,'reopen')">复开</button>
               </template>
-              <span v-if="!hasAnyAction(w)" class="dim">—</span>
+              <span v-if="(store.current && w.in_scope===false) || !hasAnyAction(w)" class="dim">{{ w.in_scope===false ? '范围外·仅查看' : '—' }}</span>
             </td>
           </tr>
         </tbody>
@@ -100,13 +102,14 @@
           <b>{{ dispatchForm.code }}</b> {{ dispatchForm.title }}
         </div>
         <div class="field">
-          <label>处理人（在组且有工单处理权限）</label>
+          <label>处理人（在组、有工单处理权限且其授权范围覆盖该工单对象）</label>
           <select v-model="dispatchForm.assignee_id">
             <option :value="''" disabled>选择成员</option>
-            <option v-for="m in assignableMembers" :key="m.id" :value="m.id">
+            <option v-for="m in dispatchCandidates" :key="m.id" :value="m.id">
               {{ m.role_label }} · {{ m.name }}{{ m.relation ? '（' + m.relation + '）' : '' }}
             </option>
           </select>
+          <span v-if="!dispatchCandidates.length" class="dim">⚠️ 没有成员的授权范围覆盖该工单对象，请先在「家庭共享」中调整成员范围</span>
         </div>
         <div class="field">
           <label>分派备注（可选）</label>
@@ -194,11 +197,34 @@ const sourceFilters = [
 // 可作为处理人的在组成员：持有 workorder_handle 权限（户主/管理员/家庭成员）
 const assignableMembers = computed(() =>
   store.family.members.filter((m) => m.status === 'active' && (m.effective_perms || []).includes('workorder_handle')))
+// 分派弹窗候选：处理权限 + 个人授权范围覆盖该工单对象
+// （后端 operate 对动作人校验范围；被分派人若范围不覆盖，接单/处理时仍会被后端拦截）
+const dispatchWo = computed(() => store.workOrders.find((w) => w.id === dispatchForm?.id))
+const dispatchCandidates = computed(() => assignableMembers.value.filter((m) => memberCoversWorkOrder(m, dispatchWo.value)))
+function memberCoversWorkOrder(member, wo) {
+  if (!wo || member.role === 'owner' || member.role === 'admin') return true
+  const sc = member.scope
+  if (!sc || sc.all) return true
+  if (wo.device_id != null) {
+    const d = store.devices.find((x) => x.id === wo.device_id)
+    if (!d) return (sc.device_ids || []).includes(wo.device_id)
+    return (sc.device_ids || []).includes(d.id) || (sc.room_ids || []).includes(d.room_id)
+  }
+  if (wo.quota_alert_id != null) {
+    const alert = store.quotaAlerts.find((a) => a.id === wo.quota_alert_id)
+    if (!alert) return true
+    if (alert.scope === 'room') return (sc.room_ids || []).includes(alert.room_id)
+    const d = store.devices.find((x) => x.id === alert.device_id)
+    return (sc.device_ids || []).includes(alert.device_id) || (!!d && (sc.room_ids || []).includes(d.room_id))
+  }
+  return true
+}
 
 function isMine(w) {
   return store.current && w.assignee_id === store.current.id
 }
 function hasAnyAction(w) {
+  if (!store.current || w.in_scope === false) return false
   if (canDispatch.value && ['open', 'reopened', 'dispatched', 'accepted', 'processing', 'suspended'].includes(w.status)) return true
   if (!canHandle.value) return false
   if (['dispatched', 'accepted', 'processing', 'suspended'].includes(w.status) && isMine(w)) return true
@@ -310,6 +336,8 @@ function fmtTime(iso) {
 <style scoped>
 .wo{display:flex;flex-direction:column;gap:16px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope{background:#12291a;border-color:rgba(102,187,106,.35);color:#a5d6a7;}
+.tag.scope{background:#2a1518;color:#ef9a9a;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}
 .kpi b{display:block;font-size:28px;color:#dbe4f3;}

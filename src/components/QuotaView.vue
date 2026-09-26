@@ -2,6 +2,7 @@
   <div class="quota">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：加入家庭后可处理定额告警（家庭成员及以上），定额配置需管理权限。</div>
     <div v-else-if="!canAlert && !canManage" class="lock-banner">🔒 当前角色没有定额相关操作权限，仅可查看定额执行与告警。</div>
+    <div v-else-if="!store.scopeAll" class="lock-banner scope">🎯 你的定额操作已限定授权房间/设备：范围外定额与告警仅可查看，配置/处理按钮由后端统一拦截；设备换房后自动重算。</div>
     <!-- KPI -->
     <div class="kpis">
       <div class="kpi"><b>{{ store.quotas.length }}</b><em>已配置定额</em></div>
@@ -61,11 +62,11 @@
         </select>
         <select v-if="form.scope==='room'" v-model.number="form.room_id" required :disabled="!!form.id">
           <option :value="''" disabled>选择房间</option>
-          <option v-for="r in store.rooms" :key="r.id" :value="r.id">{{ r.name }}</option>
+          <option v-for="r in allowedRooms" :key="r.id" :value="r.id">{{ r.name }}</option>
         </select>
         <select v-else v-model.number="form.device_id" required :disabled="!!form.id">
           <option :value="''" disabled>选择设备</option>
-          <option v-for="d in store.devices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}（{{ d.room }}）</option>
+          <option v-for="d in allowedDevices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}（{{ d.room }}）</option>
         </select>
         <select v-model="form.period">
           <option value="daily">每日</option>
@@ -114,12 +115,13 @@
           <th>状态</th><th>启用</th><th>操作</th>
         </tr></thead>
         <tbody>
-          <tr v-for="q in store.quotas" :key="q.id" :class="{disabled:!q.enabled}">
-            <td v-if="canManage" class="sel-col"><input type="checkbox" :checked="selected.includes(q.id)" @change="toggleSelect(q.id)" /></td>
+          <tr v-for="q in store.quotas" :key="q.id" :class="{disabled:!q.enabled, noscope:store.current && !q.in_scope}">
+            <td v-if="canManage" class="sel-col"><input type="checkbox" :checked="selected.includes(q.id)" :disabled="!q.in_scope" @change="toggleSelect(q.id)" /></td>
             <td>
               <i class="tag" :class="q.scope">{{ q.scope==='room'?'房间':'设备' }}</i>
               {{ q.target_name }}
               <i v-if="q.device_deleted" class="tag del">设备已删除</i>
+              <i v-if="store.current && !q.in_scope" class="tag scope">🎯 范围外</i>
             </td>
             <td>{{ q.period_label }}</td>
             <td>{{ fmt(q.limit_kwh) }} kWh</td>
@@ -137,15 +139,16 @@
               </span>
             </td>
             <td>
-              <label class="switch" :class="{locked:!canManage}">
-                <input type="checkbox" :checked="q.enabled" :disabled="!canManage" @change="store.toggleQuota(q)"/>
+              <label class="switch" :class="{locked:!canManage || !q.in_scope}">
+                <input type="checkbox" :checked="q.enabled" :disabled="!canManage || !q.in_scope" @change="store.toggleQuota(q)"/>
                 <span></span>
               </label>
             </td>
             <td class="ops">
-              <button v-if="canManage" @click="openEdit(q)">编辑</button>
+              <button v-if="canManage && q.in_scope" @click="openEdit(q)">编辑</button>
               <button @click="showHistory(q.id)">历史</button>
-              <button v-if="canManage" class="danger" @click="remove(q)">删除</button>
+              <button v-if="canManage && q.in_scope" class="danger" @click="remove(q)">删除</button>
+              <span v-if="canManage && !q.in_scope" class="dim">范围外</span>
             </td>
           </tr>
         </tbody>
@@ -195,13 +198,14 @@
           <th>级别</th><th>对象</th><th>周期</th><th>用量/额度</th><th>状态</th><th>处理备注</th><th>时间</th><th>操作</th>
         </tr></thead>
         <tbody>
-          <tr v-for="a in filteredAlerts" :key="a.id">
+          <tr v-for="a in filteredAlerts" :key="a.id" :class="{noscope:store.current && a.in_scope===false}">
             <td v-if="canAlert" class="sel-col">
-              <input v-if="a.status==='open'||a.status==='handling'" type="checkbox"
+              <input v-if="(a.status==='open'||a.status==='handling') && a.in_scope!==false" type="checkbox"
                      :checked="selectedAlerts.includes(a.id)" @change="toggleSelectAlert(a.id)" />
             </td>
             <td><span class="lv" :class="a.level">{{ a.level==='error'?'超标':'预警' }}</span>
               <i v-if="woOf(a)" class="wtag" @click="store.tab='workorder'">🎫 已生成工单 →</i>
+              <i v-if="store.current && a.in_scope===false" class="tag scope">🎯 范围外</i>
             </td>
             <td>{{ a.scope==='room'?'房间':'设备' }} · {{ a.target_name }}</td>
             <td>{{ a.period_label }}<br><span class="dim">{{ periodText(a) }}</span></td>
@@ -216,7 +220,8 @@
             </td>
             <td class="dim">{{ fmtTime(a.created_at) }}</td>
             <td class="ops">
-              <template v-if="canAlert">
+              <template v-if="canAlert && a.in_scope===false"><span class="dim">范围外·仅查看</span></template>
+              <template v-else-if="canAlert">
                 <template v-if="a.status==='open'">
                   <button class="go" @click="act(a,'handling')">开始处理</button>
                   <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
@@ -298,21 +303,32 @@ const batchEditShow = ref(false)
 const batchForm = ref({ period: '', limit: '', reason: '' })
 const batchResults = ref(null)    // 最近一次批量执行的逐项结果
 
-// 批量新建的可选对象（已存在同周期定额的置灰，避免必然失败的项）
+// 当前身份可操作的房间/设备（细粒度授权；全屋不限为全部）
+const allowedRooms = computed(() => store.scopeAll ? store.rooms : store.rooms.filter((r) => scopeRoomIds.value.includes(r.id)))
+const allowedDevices = computed(() => store.scopeAll ? store.devices : store.devices.filter((d) => d.in_scope !== false))
+const scopeRoomIds = computed(() => {
+  const m = store.family.members.find((x) => x.id === store.current?.id)
+  return m?.scope?.room_ids || []
+})
+
+// 批量新建的可选对象（已存在同周期定额的置灰，避免必然失败的项；范围外对象不列出）
 const batchTargets = computed(() => {
   if (batchCreate.value.scope === 'room') {
-    return store.rooms.map((r) => ({
+    return allowedRooms.value.map((r) => ({
       id: r.id, label: r.name,
       dup: store.quotas.some((q) => q.scope === 'room' && q.room_id === r.id && q.period === batchCreate.value.period)
     }))
   }
-  return store.devices.map((d) => ({
+  return allowedDevices.value.map((d) => ({
     id: d.id, label: `${d.type_icon} ${d.name}（${d.room}）`,
     dup: store.quotas.some((q) => q.scope === 'device' && q.device_id === d.id && q.period === batchCreate.value.period)
   }))
 })
-const allSelected = computed(() => store.quotas.length > 0 && selected.value.length === store.quotas.length)
-const activeAlertIds = computed(() => filteredAlerts.value.filter((a) => a.status === 'open' || a.status === 'handling').map((a) => a.id))
+// 批量勾选只覆盖「在范围内」的对象，全选框不会把范围外项带进请求（后端也会整批拒绝兜底）
+const selectableQuotas = computed(() => store.quotas.filter((q) => q.in_scope !== false))
+const allSelected = computed(() => selectableQuotas.value.length > 0 && selectableQuotas.value.every((q) => selected.value.includes(q.id)))
+const activeAlertIds = computed(() => filteredAlerts.value
+  .filter((a) => (a.status === 'open' || a.status === 'handling') && a.in_scope !== false).map((a) => a.id))
 const allAlertsSelected = computed(() => activeAlertIds.value.length > 0 && activeAlertIds.value.every((id) => selectedAlerts.value.includes(id)))
 const resultStats = computed(() => ({
   applied: (batchResults.value || []).filter((r) => r.ok && !r.skipped).length,
@@ -326,7 +342,7 @@ function toggleSelect(id) {
     : [...selected.value, id]
 }
 function toggleSelectAll() {
-  selected.value = allSelected.value ? [] : store.quotas.map((q) => q.id)
+  selected.value = allSelected.value ? [] : selectableQuotas.value.map((q) => q.id)
 }
 function toggleSelectAlert(id) {
   selectedAlerts.value = selectedAlerts.value.includes(id)
@@ -512,6 +528,9 @@ function changeText(h) {
 <style scoped>
 .quota{display:flex;flex-direction:column;gap:16px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope{background:#12291a;border-color:rgba(102,187,106,.35);color:#a5d6a7;}
+tr.noscope{opacity:.75;}
+.tag.scope{background:#2a1518;color:#ef9a9a;margin-left:6px;}
 .switch.locked{opacity:.45;pointer-events:none;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}
