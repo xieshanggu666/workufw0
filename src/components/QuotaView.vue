@@ -2,6 +2,7 @@
   <div class="quota">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：加入家庭后可处理定额告警（家庭成员及以上），定额配置需管理权限。</div>
     <div v-else-if="!canAlert && !canManage" class="lock-banner">🔒 当前角色没有定额相关操作权限，仅可查看定额执行与告警。</div>
+    <div v-else-if="!store.isUnscoped()" class="lock-banner scope-banner">🧭 操作范围：{{ store.scopeLabel(store.currentMember) }}；仅可配置/处理授权房间与设备的定额，范围外对象只读。</div>
     <!-- KPI -->
     <div class="kpis">
       <div class="kpi"><b>{{ store.quotas.length }}</b><em>已配置定额</em></div>
@@ -61,11 +62,11 @@
         </select>
         <select v-if="form.scope==='room'" v-model.number="form.room_id" required :disabled="!!form.id">
           <option :value="''" disabled>选择房间</option>
-          <option v-for="r in store.rooms" :key="r.id" :value="r.id">{{ r.name }}</option>
+          <option v-for="r in selectableRooms" :key="r.id" :value="r.id">{{ r.name }}</option>
         </select>
         <select v-else v-model.number="form.device_id" required :disabled="!!form.id">
           <option :value="''" disabled>选择设备</option>
-          <option v-for="d in store.devices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}（{{ d.room }}）</option>
+          <option v-for="d in selectableDevices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}（{{ d.room }}）</option>
         </select>
         <select v-model="form.period">
           <option value="daily">每日</option>
@@ -114,12 +115,13 @@
           <th>状态</th><th>启用</th><th>操作</th>
         </tr></thead>
         <tbody>
-          <tr v-for="q in store.quotas" :key="q.id" :class="{disabled:!q.enabled}">
-            <td v-if="canManage" class="sel-col"><input type="checkbox" :checked="selected.includes(q.id)" @change="toggleSelect(q.id)" /></td>
+          <tr v-for="q in store.quotas" :key="q.id" :class="{disabled:!q.enabled, outscope: canManage && !canQuota(q)}">
+            <td v-if="canManage" class="sel-col"><input type="checkbox" :checked="selected.includes(q.id)" :disabled="!canQuota(q)" @change="toggleSelect(q.id)" title="超出操作范围，不可选择" /></td>
             <td>
               <i class="tag" :class="q.scope">{{ q.scope==='room'?'房间':'设备' }}</i>
               {{ q.target_name }}
               <i v-if="q.device_deleted" class="tag del">设备已删除</i>
+              <i v-if="canManage && !canQuota(q)" class="tag lock">🔒范围外</i>
             </td>
             <td>{{ q.period_label }}</td>
             <td>{{ fmt(q.limit_kwh) }} kWh</td>
@@ -137,15 +139,16 @@
               </span>
             </td>
             <td>
-              <label class="switch" :class="{locked:!canManage}">
-                <input type="checkbox" :checked="q.enabled" :disabled="!canManage" @change="store.toggleQuota(q)"/>
+              <label class="switch" :class="{locked:!canManage || !canQuota(q)}">
+                <input type="checkbox" :checked="q.enabled" :disabled="!canManage || !canQuota(q)" @change="store.toggleQuota(q)"/>
                 <span></span>
               </label>
             </td>
             <td class="ops">
-              <button v-if="canManage" @click="openEdit(q)">编辑</button>
+              <button v-if="canManage && canQuota(q)" @click="openEdit(q)">编辑</button>
               <button @click="showHistory(q.id)">历史</button>
-              <button v-if="canManage" class="danger" @click="remove(q)">删除</button>
+              <button v-if="canManage && canQuota(q)" class="danger" @click="remove(q)">删除</button>
+              <span v-if="canManage && !canQuota(q)" class="dim">范围外只读</span>
             </td>
           </tr>
         </tbody>
@@ -197,13 +200,13 @@
         <tbody>
           <tr v-for="a in filteredAlerts" :key="a.id">
             <td v-if="canAlert" class="sel-col">
-              <input v-if="a.status==='open'||a.status==='handling'" type="checkbox"
+              <input v-if="(a.status==='open'||a.status==='handling') && canAlertRow(a)" type="checkbox"
                      :checked="selectedAlerts.includes(a.id)" @change="toggleSelectAlert(a.id)" />
             </td>
             <td><span class="lv" :class="a.level">{{ a.level==='error'?'超标':'预警' }}</span>
               <i v-if="woOf(a)" class="wtag" @click="store.tab='workorder'">🎫 已生成工单 →</i>
             </td>
-            <td>{{ a.scope==='room'?'房间':'设备' }} · {{ a.target_name }}</td>
+            <td>{{ a.scope==='room'?'房间':'设备' }} · {{ a.target_name }}<i v-if="canAlert && !canAlertRow(a)" class="tag lock">🔒范围外</i></td>
             <td>{{ a.period_label }}<br><span class="dim">{{ periodText(a) }}</span></td>
             <td>
               <b :class="a.level">{{ a.used_kwh.toFixed(2) }}</b> / {{ fmt(a.limit_kwh) }} kWh
@@ -216,7 +219,7 @@
             </td>
             <td class="dim">{{ fmtTime(a.created_at) }}</td>
             <td class="ops">
-              <template v-if="canAlert">
+              <template v-if="canAlert && canAlertRow(a)">
                 <template v-if="a.status==='open'">
                   <button class="go" @click="act(a,'handling')">开始处理</button>
                   <button class="ok-btn" @click="act(a,'resolved')">已处理</button>
@@ -231,6 +234,7 @@
                   <button @click="act(a,'open')">重新打开</button>
                 </template>
               </template>
+              <span v-else-if="canAlert" class="dim">范围外不可处理</span>
               <span v-else class="dim">无处理权限</span>
             </td>
           </tr>
@@ -275,6 +279,14 @@ import { useHomeStore } from '@/store/home'
 const store = useHomeStore()
 const canAlert = computed(() => store.can('quota_alert_handle'))
 const canManage = computed(() => store.can('quota_manage'))
+// 范围判定（与后端 canAccessQuota/告警归属校验同口径）
+function canQuota(q) { return store.canAccessQuota(q) }
+function canAlertRow(a) { return store.canAccessAlert(a) }
+// 可选配置对象：限定身份仅授权房间/设备
+const selectableRooms = computed(() =>
+  store.current && store.isUnscoped() ? store.rooms : store.rooms.filter((r) => store.canAccessRoom(r.id)))
+const selectableDevices = computed(() =>
+  store.current && store.isUnscoped() ? store.devices : store.devices.filter((d) => store.canAccessDevice(d)))
 
 const formShow = ref(false)
 const form = ref(emptyForm())
@@ -298,21 +310,23 @@ const batchEditShow = ref(false)
 const batchForm = ref({ period: '', limit: '', reason: '' })
 const batchResults = ref(null)    // 最近一次批量执行的逐项结果
 
-// 批量新建的可选对象（已存在同周期定额的置灰，避免必然失败的项）
+// 批量新建的可选对象（仅授权范围；已存在同周期定额的置灰，避免必然失败的项）
 const batchTargets = computed(() => {
   if (batchCreate.value.scope === 'room') {
-    return store.rooms.map((r) => ({
+    return selectableRooms.value.map((r) => ({
       id: r.id, label: r.name,
       dup: store.quotas.some((q) => q.scope === 'room' && q.room_id === r.id && q.period === batchCreate.value.period)
     }))
   }
-  return store.devices.map((d) => ({
+  return selectableDevices.value.map((d) => ({
     id: d.id, label: `${d.type_icon} ${d.name}（${d.room}）`,
     dup: store.quotas.some((q) => q.scope === 'device' && q.device_id === d.id && q.period === batchCreate.value.period)
   }))
 })
-const allSelected = computed(() => store.quotas.length > 0 && selected.value.length === store.quotas.length)
-const activeAlertIds = computed(() => filteredAlerts.value.filter((a) => a.status === 'open' || a.status === 'handling').map((a) => a.id))
+// 批量勾选只覆盖当前可管理（在范围内）的定额
+const manageableQuotas = computed(() => store.quotas.filter((q) => canManage.value && canQuota(q)))
+const allSelected = computed(() => manageableQuotas.value.length > 0 && manageableQuotas.value.every((q) => selected.value.includes(q.id)))
+const activeAlertIds = computed(() => filteredAlerts.value.filter((a) => (a.status === 'open' || a.status === 'handling') && canAlertRow(a)).map((a) => a.id))
 const allAlertsSelected = computed(() => activeAlertIds.value.length > 0 && activeAlertIds.value.every((id) => selectedAlerts.value.includes(id)))
 const resultStats = computed(() => ({
   applied: (batchResults.value || []).filter((r) => r.ok && !r.skipped).length,
@@ -326,7 +340,7 @@ function toggleSelect(id) {
     : [...selected.value, id]
 }
 function toggleSelectAll() {
-  selected.value = allSelected.value ? [] : store.quotas.map((q) => q.id)
+  selected.value = allSelected.value ? [] : manageableQuotas.value.map((q) => q.id)
 }
 function toggleSelectAlert(id) {
   selectedAlerts.value = selectedAlerts.value.includes(id)
@@ -448,12 +462,13 @@ onMounted(loadHistory)
 // 每次 store 轮询刷新后同步全局历史（处于某额度过滤视图时不覆盖）
 watch(() => store.quotaAlerts, () => { if (!historyQuota.value) loadHistory() })
 // 轮询刷新后清理已消失的勾选项（定额被删、告警被解除/闭环），避免对已失效对象执行批量操作
+// 轮询刷新后清理已消失/越界的勾选项（定额被删、告警被解除/闭环、设备换房导致范围变化）
 watch(() => store.quotas, (qs) => {
-  const ids = new Set(qs.map((q) => q.id))
+  const ids = new Set(qs.filter((q) => canQuota(q)).map((q) => q.id))
   selected.value = selected.value.filter((id) => ids.has(id))
 })
 watch(() => store.quotaAlerts, (as) => {
-  const ids = new Set(as.filter((a) => a.status === 'open' || a.status === 'handling').map((a) => a.id))
+  const ids = new Set(as.filter((a) => (a.status === 'open' || a.status === 'handling') && canAlertRow(a)).map((a) => a.id))
   selectedAlerts.value = selectedAlerts.value.filter((id) => ids.has(id))
 })
 
@@ -512,6 +527,9 @@ function changeText(h) {
 <style scoped>
 .quota{display:flex;flex-direction:column;gap:16px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope-banner{background:#10233f;border-color:rgba(66,165,245,.4);color:#80deea;}
+tr.outscope{opacity:.62;}
+.tag.lock{background:#0f2a36;color:#80deea;margin-left:6px;}
 .switch.locked{opacity:.45;pointer-events:none;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}

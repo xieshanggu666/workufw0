@@ -60,17 +60,19 @@ export const useHomeStore = defineStore('home', {
     activeMembers: (s) => s.family.members.filter((m) => m.status === 'active'),
     pendingInvites: (s) => s.family.invites.filter((i) => i.status === 'pending'),
     // 当前身份是否具备某权限（后端会再次强制校验，前端仅用于按钮置灰等交互）
-    can: (s) => (perm) => !!s.current && (s.current.effective_perms || []).includes(perm),
-    isManager: (s) => !!s.current && (s.current.effective_perms || []).includes('member_manage')
+    can: (s) => (perm) => !!s.current && (s.currentMember?.effective_perms || s.current.effective_perms || []).includes(perm),
+    isManager: (s) => !!s.current && (s.currentMember?.effective_perms || s.current.effective_perms || []).includes('member_manage'),
+    // 当前登录成员在名册中的完整记录（含操作范围）；浏览模式为 null
+    currentMember: (s) => s.current ? (s.family.members.find((m) => m.id === s.current.id) || null) : null
   },
   actions: {
     async load() {
       const d = await api('/state')
       const firstLoad = !this.loaded
-      this.current = d.current
-        ? { ...d.current, effective_perms: (d.family.members.find((m) => m.id === d.current.id) || {}).effective_perms || [] }
-        : null
       this.family = d.family || { roles: {}, permissions: {}, members: [], invites: [] }
+      this.current = d.current
+        ? { ...d.current, effective_perms: (this.family.members.find((m) => m.id === d.current.id) || {}).effective_perms || [] }
+        : null
       this.rooms = d.rooms
       this.types = d.types
       this.devices = d.devices
@@ -146,6 +148,65 @@ export const useHomeStore = defineStore('home', {
       this.toast = { msg, type, id: Date.now() }
     },
     clearToast() { this.toast = null },
+
+    // ===== 按房间/设备的操作范围（与后端 canAccess* 同口径，仅用于按钮置灰；后端最终裁决）=====
+    scopeOf(who) {
+      if (!who) return { rooms: [], devices: [], unscoped: false }
+      return { rooms: who.scope_rooms || [], devices: who.scope_devices || [], unscoped: !!who.unscoped }
+    },
+    // 全屋不限定：户主，或未设任何范围白名单
+    isUnscoped(who = this.currentMember) {
+      if (!who) return false
+      return who.role === 'owner' || ((who.scope_rooms || []).length === 0 && (who.scope_devices || []).length === 0)
+    },
+    canAccessDevice(device, who = this.currentMember) {
+      if (!device || !who) return false
+      if (this.isUnscoped(who)) return true
+      return (who.scope_devices || []).includes(device.id) || (who.scope_rooms || []).includes(device.room_id)
+    },
+    canAccessRoom(roomId, who = this.currentMember) {
+      if (roomId == null || !who) return false
+      if (this.isUnscoped(who)) return true
+      return (who.scope_rooms || []).includes(roomId)
+    },
+    canAccessQuota(q, who = this.currentMember) {
+      if (!q || !who) return false
+      if (this.isUnscoped(who)) return true
+      if (q.scope === 'room') return this.canAccessRoom(q.room_id, who)
+      const d = this.devices.find((x) => x.id === q.device_id)
+      if (d) return this.canAccessDevice(d, who)
+      // 设备已删除：仅显式设备授权成员可见可操作
+      return (who.scope_devices || []).includes(q.device_id)
+    },
+    canAccessAlert(a, who = this.currentMember) {
+      if (!a || !who) return false
+      if (this.isUnscoped(who)) return true
+      const q = this.quotas.find((x) => x.id === a.quota_id)
+      return q ? this.canAccessQuota(q, who) : false
+    },
+    canAccessWorkOrder(w, who = this.currentMember) {
+      if (!w || !who) return false
+      if (this.isUnscoped(who)) return true
+      if (w.device_id != null) {
+        const d = this.devices.find((x) => x.id === w.device_id)
+        return d ? this.canAccessDevice(d, who) : (who.scope_devices || []).includes(w.device_id)
+      }
+      if (w.quota_alert_id != null) {
+        const a = this.quotaAlerts.find((x) => x.id === w.quota_alert_id)
+        return a ? this.canAccessAlert(a, who) : false
+      }
+      return false
+    },
+    // 范围中文摘要（成员卡片、邀请表格、加入预览共用）
+    scopeLabel(who) {
+      if (this.isUnscoped(who)) return '全屋'
+      const rn = (id) => this.rooms.find((r) => r.id === id)?.name || `房间#${id}`
+      const dn = (id) => this.devices.find((d) => d.id === id)?.name || `设备#${id}`
+      const parts = []
+      if ((who.scope_rooms || []).length) parts.push('房间 ' + who.scope_rooms.map(rn).join('、'))
+      if ((who.scope_devices || []).length) parts.push('设备 ' + who.scope_devices.map(dn).join('、'))
+      return parts.join('；')
+    },
 
     async addDevice(p) {
       try { await api('/device', 'POST', p); await this.load(); this.toastMsg('已新增设备', 'success') }

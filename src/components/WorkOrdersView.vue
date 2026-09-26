@@ -2,6 +2,7 @@
   <div class="wo">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：加入家庭后可处理工单；家庭成员默认可接单/处理/完成，分派与改派需管理权限。</div>
     <div v-else-if="!canDispatch && !canHandle" class="lock-banner">🔒 当前角色没有工单相关操作权限，仅可查看工单。</div>
+    <div v-else-if="!store.isUnscoped()" class="lock-banner scope-banner">🧭 操作范围：{{ store.scopeLabel(store.currentMember) }}；仅可分派/处理授权房间与设备相关的工单。</div>
 
     <!-- KPI -->
     <div class="kpis">
@@ -40,6 +41,7 @@
               <span class="src">{{ w.source_icon }} {{ w.source_label }}</span>
               <span class="target">{{ w.target_name }}</span>
               <i v-if="w.device_deleted" class="tag del">设备已删除</i>
+              <i v-if="store.current && !store.canAccessWorkOrder(w)" class="tag lock">🔒范围外</i>
             </td>
             <td><span class="lv" :class="w.level">{{ w.level==='error'?'紧急':'一般' }}</span></td>
             <td><span class="st" :class="w.status">{{ w.status_label }}</span></td>
@@ -57,26 +59,26 @@
             </td>
             <td class="dim">{{ fmtTime(w.created_at) }}</td>
             <td class="ops" @click.stop>
-              <template v-if="canDispatch && ['open','reopened','dispatched','accepted','processing','suspended'].includes(w.status)">
+              <template v-if="canDispatch && canWo(w) && ['open','reopened','dispatched','accepted','processing','suspended'].includes(w.status)">
                 <button class="go" @click="openDispatch(w)">
                   {{ ['dispatched','accepted','processing','suspended'].includes(w.status) ? '改派' : '分派' }}
                 </button>
               </template>
-              <template v-if="canHandle && w.status==='dispatched' && isMine(w)">
+              <template v-if="canHandle && canWo(w) && w.status==='dispatched' && isMine(w)">
                 <button class="ok-btn" @click="act(w,'accept')">接单</button>
               </template>
-              <template v-if="canHandle && w.status==='accepted' && isMine(w)">
+              <template v-if="canHandle && canWo(w) && w.status==='accepted' && isMine(w)">
                 <button class="go" @click="act(w,'start')">开始处理</button>
               </template>
-              <template v-if="canHandle && w.status==='processing' && isMine(w)">
+              <template v-if="canHandle && canWo(w) && w.status==='processing' && isMine(w)">
                 <button class="susp" @click="act(w,'suspend')">挂起</button>
                 <button class="ok-btn" @click="act(w,'complete')">完成</button>
               </template>
-              <template v-if="canHandle && w.status==='suspended' && isMine(w)">
+              <template v-if="canHandle && canWo(w) && w.status==='suspended' && isMine(w)">
                 <button class="go" @click="act(w,'resume')">继续</button>
                 <button class="ok-btn" @click="act(w,'complete')">完成</button>
               </template>
-              <template v-if="canHandle && w.status==='completed' && w.source_active">
+              <template v-if="canHandle && canWo(w) && w.status==='completed' && w.source_active">
                 <button class="reopen" @click="act(w,'reopen')">复开</button>
               </template>
               <span v-if="!hasAnyAction(w)" class="dim">—</span>
@@ -172,6 +174,11 @@ const store = useHomeStore()
 const canDispatch = computed(() => store.can('workorder_dispatch'))
 const canHandle = computed(() => store.can('workorder_handle'))
 
+// 工单对象是否在当前身份操作范围内（与后端 canAccessWorkOrder 同口径）
+function canWo(w) { return store.canAccessWorkOrder(w) }
+// 当前打开分派弹窗的工单（用于过滤可选处理人）
+const dispatchTarget = ref(null)
+
 const statusFilter = ref('active')
 const sourceFilter = ref('all')
 const onlyMine = ref(false)
@@ -191,14 +198,18 @@ const sourceFilters = [
   { v: 'quota_over', t: '🚨 能耗超标' }
 ]
 
-// 可作为处理人的在组成员：持有 workorder_handle 权限（户主/管理员/家庭成员）
+// 可作为处理人的在组成员：持有 workorder_handle 权限，且操作范围覆盖该工单对象
+// （后端分派时同样校验被分派者范围；无覆盖对象的成员不在列表中）
 const assignableMembers = computed(() =>
-  store.family.members.filter((m) => m.status === 'active' && (m.effective_perms || []).includes('workorder_handle')))
+  store.family.members
+    .filter((m) => m.status === 'active' && (m.effective_perms || []).includes('workorder_handle'))
+    .filter((m) => !dispatchTarget.value || store.canAccessWorkOrder(dispatchTarget.value, m)))
 
 function isMine(w) {
   return store.current && w.assignee_id === store.current.id
 }
 function hasAnyAction(w) {
+  if (!canWo(w)) return false
   if (canDispatch.value && ['open', 'reopened', 'dispatched', 'accepted', 'processing', 'suspended'].includes(w.status)) return true
   if (!canHandle.value) return false
   if (['dispatched', 'accepted', 'processing', 'suspended'].includes(w.status) && isMine(w)) return true
@@ -263,11 +274,12 @@ function labelOf(a) {
 const dispatchShow = ref(false)
 const dispatchForm = reactive({ id: null, code: '', title: '', assignee_id: '', note: '', reassign: false })
 function openDispatch(w) {
+  dispatchTarget.value = w
   dispatchForm.id = w.id
   dispatchForm.code = w.code
   dispatchForm.title = w.title
   const inFlight = ['dispatched', 'accepted', 'processing', 'suspended'].includes(w.status)
-  dispatchForm.assignee_id = inFlight ? w.assignee_id : ''
+  dispatchForm.assignee_id = inFlight && assignableMembers.value.some((m) => m.id === w.assignee_id) ? w.assignee_id : ''
   dispatchForm.note = ''
   dispatchForm.reassign = inFlight
   dispatchShow.value = true
@@ -279,6 +291,7 @@ async function submitDispatch() {
   if (r) {
     store.toastMsg(dispatchForm.reassign ? '工单已改派' : '工单已分派', 'success')
     dispatchShow.value = false
+    dispatchTarget.value = null
     if (detail.value && detail.value.id === dispatchForm.id) await refreshDetail(dispatchForm.id)
   }
 }
@@ -310,6 +323,8 @@ function fmtTime(iso) {
 <style scoped>
 .wo{display:flex;flex-direction:column;gap:16px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope-banner{background:#10233f;border-color:rgba(66,165,245,.4);color:#80deea;}
+.tag.lock{background:#0f2a36;color:#80deea;margin-left:6px;}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
 .kpi{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;text-align:center;}
 .kpi b{display:block;font-size:28px;color:#dbe4f3;}

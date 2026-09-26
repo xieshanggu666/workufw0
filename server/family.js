@@ -15,6 +15,15 @@
 // 可回收闭环：邀请(pending) → 接受(active, 发令牌) → 协作操作（全部记入家庭日志，带操作人）
 //   → 撤销(revoked, 令牌立即失效、所有授权收回) → 重新邀请/恢复（新邀请或复用原身份回到 active）。
 //   邀请也可在接受前取消/过期；每个状态迁移都写家庭日志。
+//
+// 细粒度操作范围（scope_rooms / scope_devices，户主恒为全屋、不可限定）：
+//   - 两列均为空 = 全屋不限定；任一非空 = 白名单，取「房间 ∪ 指定设备」并集
+//   - 房间授权按设备「当前所在房间」动态判定，设备授权绑定 device_id 稳定跟随；
+//     设备换房时显式设备授权自动迁移、无需改写授权，房间授权随换房当场收窄/放开
+//   - 范围在邀请/编辑时设定，邀请快照携带（含续邀、重新邀请），接受即随令牌生效；
+//     编辑/撤销后同一令牌下一次请求即按新范围拦截（设备控制/场景/定额/工单统一校验）
+//
+// 设备/房间删除后，范围中残留的 id 只是永远匹配不上（不影响其余授权），无需迁移清理。
 
 const INVITE_TTL_MS = 7 * 24 * 3600_000   // 邀请有效期 7 天
 
@@ -66,6 +75,28 @@ function parsePerms(raw) {
 function validPerms(list) {
   return [...new Set((Array.isArray(list) ? list : []).filter((k) => PERMISSIONS[k]))]
 }
+// 范围 id 列表：去重、过滤为正整数（房间/设备存在性由具体业务校验，删除后的残留 id 永不命中）
+function parseIdList(raw) {
+  let a
+  try { a = JSON.parse(raw || '[]') } catch { return [] }
+  if (!Array.isArray(a)) return []
+  return [...new Set(a.map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+}
+function validIdList(list) {
+  return parseIdList(JSON.stringify(list))
+}
+// 取成员/邀请上的操作范围 {rooms:[],devices:[]}
+export function memberScope(who) {
+  if (!who) return { rooms: [], devices: [] }
+  return { rooms: parseIdList(who.scope_rooms), devices: parseIdList(who.scope_devices) }
+}
+// 是否全屋不限定（户主恒为全屋；两列皆空也为全屋）
+export function isUnscoped(who) {
+  if (!who) return false
+  if (who.role === 'owner') return true
+  const sc = memberScope(who)
+  return sc.rooms.length === 0 && sc.devices.length === 0
+}
 
 // 设备日志表补「操作人」列（旧库迁移）：家庭协作要求每条操作可归因到成员/访客
 function migrateLogs() {
@@ -75,10 +106,22 @@ function migrateLogs() {
   if (!cols.includes('category')) db.exec("ALTER TABLE device_logs ADD COLUMN category TEXT NOT NULL DEFAULT 'device'")
 }
 
+// 成员/邀请表补「操作范围」列（旧库迁移）：按房间/设备限定的白名单 JSON（空数组=全屋不限定）
+function migrateScopeCols() {
+  for (const table of ['household_members', 'household_invites']) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name)
+    if (cols.length && !cols.includes('scope_rooms'))
+      db.exec(`ALTER TABLE ${table} ADD COLUMN scope_rooms TEXT NOT NULL DEFAULT '[]'`)
+    if (cols.length && !cols.includes('scope_devices'))
+      db.exec(`ALTER TABLE ${table} ADD COLUMN scope_devices TEXT NOT NULL DEFAULT '[]'`)
+  }
+}
+
 export function initFamily(database, notifyFn) {
   db = database
   if (typeof notifyFn === 'function') notify = notifyFn
   migrateLogs()
+  migrateScopeCols()
   db.exec(`
   CREATE TABLE IF NOT EXISTS household_members (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +129,8 @@ export function initFamily(database, notifyFn) {
     relation TEXT NOT NULL DEFAULT '',       -- 关系/称呼，如 妈妈、保洁阿姨
     role TEXT NOT NULL,                      -- owner/admin/member/guest
     perms TEXT NOT NULL DEFAULT '[]',        -- 显式权限键 JSON（与角色默认取并集）
+    scope_rooms TEXT NOT NULL DEFAULT '[]',  -- 可操作房间 id JSON（[] 且 scope_devices 也为 [] 时=全屋）
+    scope_devices TEXT NOT NULL DEFAULT '[]',-- 可操作设备 id JSON（设备授权绑定 device_id，换房自动跟随）
     status TEXT NOT NULL DEFAULT 'active',   -- active / revoked
     token TEXT UNIQUE,                       -- 访问令牌；撤销即失效，恢复/重新接受时换新
     invited_by INTEGER,                      -- 邀请人 member id（户主为自身）
@@ -102,6 +147,8 @@ export function initFamily(database, notifyFn) {
     relation TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL,
     perms TEXT NOT NULL DEFAULT '[]',
+    scope_rooms TEXT NOT NULL DEFAULT '[]',  -- 接受时随身份生效的操作范围快照（续邀沿用、重邀沿用成员现值）
+    scope_devices TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'pending',  -- pending / accepted / canceled / expired
     expires_at TEXT NOT NULL,
     created_by INTEGER NOT NULL,
@@ -118,9 +165,9 @@ export function initFamily(database, notifyFn) {
     memberByToken: db.prepare('SELECT * FROM household_members WHERE token=?'),
     allMembers: db.prepare('SELECT * FROM household_members ORDER BY id'),
     insertMember: db.prepare(`INSERT INTO household_members
-      (name,relation,role,perms,status,token,invited_by,invited_at,joined_at)
-      VALUES (?,?,?,?,?,?,?,?,?)`),
-    updateMember: db.prepare('UPDATE household_members SET name=?,relation=?,role=?,perms=? WHERE id=?'),
+      (name,relation,role,perms,scope_rooms,scope_devices,status,token,invited_by,invited_at,joined_at)
+      VALUES (?,?,?,?,?,? ,?,?,?,?,?)`),
+    updateMember: db.prepare('UPDATE household_members SET name=?,relation=?,role=?,perms=?,scope_rooms=?,scope_devices=? WHERE id=?'),
     revokeMember: db.prepare(`UPDATE household_members SET status='revoked',token=NULL,revoked_at=?,revoke_reason=? WHERE id=?`),
     restoreMember: db.prepare(`UPDATE household_members SET status='active',token=?,revoked_at=NULL,revoke_reason='' WHERE id=?`),
     inviteById: db.prepare('SELECT * FROM household_invites WHERE id=?'),
@@ -129,8 +176,8 @@ export function initFamily(database, notifyFn) {
     allInvites: db.prepare('SELECT * FROM household_invites ORDER BY id DESC'),
     pendingInvites: db.prepare("SELECT * FROM household_invites WHERE status='pending' ORDER BY id DESC"),
     insertInvite: db.prepare(`INSERT INTO household_invites
-      (code,name,relation,role,perms,status,expires_at,created_by,created_at)
-      VALUES (?,?,?,?,?, 'pending', ?,?,?)`),
+      (code,name,relation,role,perms,scope_rooms,scope_devices,status,expires_at,created_by,created_at)
+      VALUES (?,?,?,?,?,? ,?, 'pending', ?,?,?)`),
     acceptInvite: db.prepare(`UPDATE household_invites SET status='accepted',accepted_member_id=?,accepted_at=? WHERE id=?`),
     cancelInvite: db.prepare(`UPDATE household_invites SET status='canceled',cancel_reason=? WHERE id=?`),
     expireInvite: db.prepare("UPDATE household_invites SET status='expired' WHERE id=?"),
@@ -160,6 +207,37 @@ function canManage(actor, target) {
   return false
 }
 
+// ===== 细粒度操作范围校验（设备控制 / 场景执行 / 定额 / 工单统一入口）=====
+// 全屋（户主或未设范围）放行；限定范围取「授权房间（按设备当前房间）∪ 显式授权设备」并集。
+// deviceRow 需含 id 与 room_id；roomId 为房间维度授权（如新建设备落到某房间）。
+export function canAccessDevice(who, deviceRow) {
+  if (!who || who.status !== 'active' || !deviceRow) return false
+  if (who.role === 'owner') return true
+  const sc = memberScope(who)
+  if (sc.rooms.length === 0 && sc.devices.length === 0) return true
+  return sc.devices.includes(Number(deviceRow.id)) || sc.rooms.includes(Number(deviceRow.room_id))
+}
+export function canAccessRoom(who, roomId) {
+  if (!who || who.status !== 'active' || roomId == null) return false
+  if (who.role === 'owner') return true
+  const sc = memberScope(who)
+  if (sc.rooms.length === 0 && sc.devices.length === 0) return true
+  return sc.rooms.includes(Number(roomId))
+}
+
+// 范围中文摘要（家庭日志/前端展示共用）：优先用传入的房间、设备列表解析名字，
+// 已删除对象回退「房间#id / 设备#id」，保证授权审计不因对象删除而丢失
+export function scopeSummary(who, roomList = [], deviceList = []) {
+  if (isUnscoped(who)) return '全屋'
+  const sc = memberScope(who)
+  const roomName = (id) => roomList.find((r) => Number(r.id) === id)?.name || `房间#${id}`
+  const devName = (id) => deviceList.find((d) => Number(d.id) === id)?.name || `设备#${id}`
+  const parts = []
+  if (sc.rooms.length) parts.push(`房间：${sc.rooms.map(roomName).join('、')}`)
+  if (sc.devices.length) parts.push(`设备：${sc.devices.map(devName).join('、')}`)
+  return parts.join('；')
+}
+
 // ===== 令牌解析（请求身份）；令牌不存在/已撤销一律视为无身份 =====
 export function getMemberByToken(tok) {
   if (!tok) return null
@@ -169,7 +247,7 @@ export function getMemberByToken(tok) {
 }
 
 // ===== 邀请生命周期 =====
-export function createInvite(actor, { name, relation = '', role, perms }) {
+export function createInvite(actor, { name, relation = '', role, perms, scope_rooms, scope_devices }) {
   if (!can(actor, 'member_manage')) throw new Error('无成员管理权限')
   name = String(name || '').trim()
   if (!name) throw new Error('请填写受邀人名称')
@@ -183,14 +261,30 @@ export function createInvite(actor, { name, relation = '', role, perms }) {
   const exp = new Date(at.getTime() + INVITE_TTL_MS)
   const code = uniqueCode()
   const permList = validPerms(perms)
+  // 户主不可限定；管理员可被户主限定（admin 只管成员/访客，其自身范围用于设备/定额/工单操作）
+  const scopeRooms = role === 'owner' ? [] : validIdList(scope_rooms)
+  const scopeDevices = role === 'owner' ? [] : validIdList(scope_devices)
   const r = stmts.insertInvite.run(code, name, String(relation || ''), role,
-    JSON.stringify(permList), exp.toISOString(), actor.id, at.toISOString())
+    JSON.stringify(permList), JSON.stringify(scopeRooms), JSON.stringify(scopeDevices),
+    exp.toISOString(), actor.id, at.toISOString())
   notify({
     device: '👥', action: '邀请成员',
-    detail: `${actorLabel(actor)} 向「${name}${relation ? '·' + relation : ''}」发出${ROLE_LABEL[role]}邀请，邀请码 ${code}（7 天内有效）`,
+    detail: `${actorLabel(actor)} 向「${name}${relation ? '·' + relation : ''}」发出${ROLE_LABEL[role]}邀请，邀请码 ${code}（7 天内有效），` +
+      `授权范围 ${permSummary(role, permList)}，操作范围 ${inviteScopeText(scopeRooms, scopeDevices)}`,
     operator: actor.name, operator_role: ROLE_LABEL[actor.role]
   }, 'member')
   return stmts.inviteById.get(r.lastInsertRowid)
+}
+
+// 邀请/成员行上的操作范围摘要（懒查房间/设备名，仅管理事件日志用）
+function inviteScopeText(rooms, devices) {
+  if (!rooms.length && !devices.length) return '全屋'
+  const rn = (id) => db.prepare('SELECT name FROM rooms WHERE id=?').get(id)?.name || `房间#${id}`
+  const dn = (id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name || `设备#${id}`
+  const parts = []
+  if (rooms.length) parts.push(`房间：${rooms.map(rn).join('、')}`)
+  if (devices.length) parts.push(`设备：${devices.map(dn).join('、')}`)
+  return parts.join('；')
 }
 
 function uniqueCode() {
@@ -216,19 +310,23 @@ export function acceptInvite(code) {
   const at = new Date()
   let memberId
   if (exist) {
-    // 同名的已撤销成员：复用原身份回到在组，角色/权限以本次邀请为准（可回收闭环的「再加入」）
-    stmts.updateMember.run(exist.name, inv.relation, inv.role, inv.perms, exist.id)
+    // 同名的已撤销成员：复用原身份回到在组，角色/权限/范围以本次邀请为准（可回收闭环的「再加入」）
+    stmts.updateMember.run(exist.name, inv.relation, inv.role, inv.perms,
+      inv.scope_rooms, inv.scope_devices, exist.id)
     stmts.restoreMember.run(token(), exist.id)
     memberId = exist.id
   } else {
     const r = stmts.insertMember.run(inv.name, inv.relation, inv.role, inv.perms,
+      inv.scope_rooms, inv.scope_devices,
       'active', token(), inv.created_by, inv.created_at, at.toISOString())
     memberId = Number(r.lastInsertRowid)
   }
   stmts.acceptInvite.run(memberId, at.toISOString(), inv.id)
+  const sc = { rooms: parseIdList(inv.scope_rooms), devices: parseIdList(inv.scope_devices) }
   notify({
     device: '🎉', action: '接受邀请',
-    detail: `「${inv.name}」凭邀请码 ${code} 加入家庭，角色：${ROLE_LABEL[inv.role]}，授权范围 ${permSummary(inv.role, parsePerms(inv.perms))}`,
+    detail: `「${inv.name}」凭邀请码 ${code} 加入家庭，角色：${ROLE_LABEL[inv.role]}，授权范围 ${permSummary(inv.role, parsePerms(inv.perms))}` +
+      `，操作范围 ${inviteScopeText(sc.rooms, sc.devices)}`,
     operator: inv.name, operator_role: ROLE_LABEL[inv.role]
   }, 'member')
   return stmts.memberById.get(memberId)
@@ -266,8 +364,9 @@ export function resendInvite(actor, id) {
   return stmts.inviteById.get(inv.id)
 }
 
-// 编辑成员：改称呼/角色/自定义权限。降权即立即生效（操作人令牌不变，授权范围当场收窄）
-export function updateMember(actor, id, { name, relation, role, perms }) {
+// 编辑成员：改称呼/角色/自定义权限/操作范围。降权/收窄即立即生效
+// （操作人令牌不变，授权范围当场收窄，设备控制/场景/定额/工单下一次请求即按新范围拦截）
+export function updateMember(actor, id, { name, relation, role, perms, scope_rooms, scope_devices }) {
   if (!can(actor, 'member_manage')) throw new Error('无成员管理权限')
   const m = stmts.memberById.get(Number(id))
   if (!m) throw new Error('成员不存在')
@@ -281,6 +380,9 @@ export function updateMember(actor, id, { name, relation, role, perms }) {
   const dup = db.prepare('SELECT id FROM household_members WHERE name=? AND id<>?').get(nextName, m.id)
   if (dup) throw new Error('该名称已被其他成员使用')
   const nextPerms = JSON.stringify(validPerms(perms))
+  // 范围缺省（未传字段）时保持原值；显式传入才覆盖，避免旧调用方误清空
+  const nextScopeRooms = scope_rooms === undefined ? parseIdList(m.scope_rooms) : validIdList(scope_rooms)
+  const nextScopeDevices = scope_devices === undefined ? parseIdList(m.scope_devices) : validIdList(scope_devices)
 
   const changes = []
   if (nextName !== m.name) changes.push(`名称「${m.name}」→「${nextName}」`)
@@ -292,8 +394,24 @@ export function updateMember(actor, id, { name, relation, role, perms }) {
   const revoked = [...oldSet].filter((p) => !nextSet.has(p))
   if (granted.length) changes.push(`授予：${granted.map((p) => PERMISSIONS[p].split('（')[0]).join('、')}`)
   if (revoked.length) changes.push(`收回：${revoked.map((p) => PERMISSIONS[p].split('（')[0]).join('、')}`)
+  // 操作范围变化逐项对照（房间/设备的授予与回收分别记录，对象删除时仍以 #id 可审计）
+  const oldSc = memberScope(m)
+  const roomText = (id) => db.prepare('SELECT name FROM rooms WHERE id=?').get(id)?.name || `房间#${id}`
+  const devText = (id) => db.prepare('SELECT name FROM devices WHERE id=?').get(id)?.name || `设备#${id}`
+  const addRooms = nextScopeRooms.filter((x) => !oldSc.rooms.includes(x))
+  const delRooms = oldSc.rooms.filter((x) => !nextScopeRooms.includes(x))
+  const addDevs = nextScopeDevices.filter((x) => !oldSc.devices.includes(x))
+  const delDevs = oldSc.devices.filter((x) => !nextScopeDevices.includes(x))
+  if (addRooms.length) changes.push(`放开房间：${addRooms.map(roomText).join('、')}`)
+  if (delRooms.length) changes.push(`收回房间：${delRooms.map(roomText).join('、')}`)
+  if (addDevs.length) changes.push(`放开设备：${addDevs.map(devText).join('、')}`)
+  if (delDevs.length) changes.push(`收回设备：${delDevs.map(devText).join('、')}`)
+  const wasUnscoped = oldSc.rooms.length === 0 && oldSc.devices.length === 0
+  const nowUnscoped = nextScopeRooms.length === 0 && nextScopeDevices.length === 0
+  if (!wasUnscoped && nowUnscoped && nextRole !== 'owner') changes.push('操作范围改为全屋')
 
-  stmts.updateMember.run(nextName, relation !== undefined ? String(relation) : m.relation, nextRole, nextPerms, m.id)
+  stmts.updateMember.run(nextName, relation !== undefined ? String(relation) : m.relation, nextRole, nextPerms,
+    JSON.stringify(nextScopeRooms), JSON.stringify(nextScopeDevices), m.id)
   notify({
     device: '🛠️', action: '调整成员权限',
     detail: `${actorLabel(actor)} 编辑成员「${m.name}」：${changes.join('，') || '无变化'}`,
@@ -329,12 +447,12 @@ export function restoreMember(actor, id) {
   stmts.restoreMember.run(token(), m.id)
   notify({
     device: '♻️', action: '恢复成员',
-    detail: `${actorLabel(actor)} 恢复${ROLE_LABEL[m.role]}「${m.name}」并重新签发访问令牌，授权范围 ${permSummary(m.role, parsePerms(m.perms))}`,
+    detail: `${actorLabel(actor)} 恢复${ROLE_LABEL[m.role]}「${m.name}」并重新签发访问令牌，授权范围 ${permSummary(m.role, parsePerms(m.perms))}，操作范围 ${inviteScopeText(...scopePair(m))}`,
     operator: actor.name, operator_role: ROLE_LABEL[actor.role]
   }, 'member')
 }
 
-// 为已撤销成员重新发起邀请（原身份保留，接受时角色权限以新邀请为准）
+// 为已撤销成员重新发起邀请（原身份保留，接受时角色/权限/范围以新邀请为准）
 export function reinviteMember(actor, id) {
   if (!can(actor, 'member_manage')) throw new Error('无成员管理权限')
   const m = stmts.memberById.get(Number(id))
@@ -344,14 +462,21 @@ export function reinviteMember(actor, id) {
   const at = new Date()
   const exp = new Date(at.getTime() + INVITE_TTL_MS)
   const code = uniqueCode()
+  const [rooms, devices] = scopePair(m)
   const r = stmts.insertInvite.run(code, m.name, m.relation, m.role, m.perms,
+    JSON.stringify(rooms), JSON.stringify(devices),
     exp.toISOString(), actor.id, at.toISOString())
   notify({
     device: '✉️', action: '重新邀请',
-    detail: `${actorLabel(actor)} 向已撤销的「${m.name}」重新发出${ROLE_LABEL[m.role]}邀请，邀请码 ${code}`,
+    detail: `${actorLabel(actor)} 向已撤销的「${m.name}」重新发出${ROLE_LABEL[m.role]}邀请，邀请码 ${code}，操作范围 ${inviteScopeText(rooms, devices)}`,
     operator: actor.name, operator_role: ROLE_LABEL[actor.role]
   }, 'member')
   return stmts.inviteById.get(r.lastInsertRowid)
+}
+
+function scopePair(who) {
+  const sc = memberScope(who)
+  return [sc.rooms, sc.devices]
 }
 
 // 惰性过期：到期的待接受邀请结存为 expired
@@ -369,22 +494,30 @@ function expireStaleInvites(at) {
 
 // ===== 序列化视图 =====
 function memberView(m) {
+  const sc = memberScope(m)
   return {
     id: m.id, name: m.name, relation: m.relation, role: m.role,
     role_label: ROLE_LABEL[m.role],
     status: m.status, status_label: STATUS_LABEL[m.status],
     perms: parsePerms(m.perms),
     effective_perms: effectivePerms(m),
+    scope_rooms: sc.rooms,
+    scope_devices: sc.devices,
+    unscoped: isUnscoped(m),
     invited_by: m.invited_by,
     invited_at: m.invited_at, joined_at: m.joined_at,
     revoked_at: m.revoked_at, revoke_reason: m.revoke_reason
   }
 }
 function inviteView(i) {
+  const sc = memberScope(i)
   return {
     id: i.id, code: i.code, name: i.name, relation: i.relation,
     role: i.role, role_label: ROLE_LABEL[i.role],
     perms: parsePerms(i.perms),
+    scope_rooms: sc.rooms,
+    scope_devices: sc.devices,
+    unscoped: sc.rooms.length === 0 && sc.devices.length === 0,
     status: i.status, status_label: INVITE_STATUS_LABEL[i.status],
     expires_at: i.expires_at, expired: i.status === 'pending' && new Date(i.expires_at).getTime() <= Date.now(),
     created_by: i.created_by, created_at: i.created_at,
@@ -417,7 +550,11 @@ export function previewInvite(code) {
   return {
     code: inv.code, name: inv.name, relation: inv.relation,
     role: inv.role, role_label: ROLE_LABEL[inv.role],
-    perms: parsePerms(inv.perms), expires_at: inv.expires_at
+    perms: parsePerms(inv.perms),
+    scope_rooms: parseIdList(inv.scope_rooms),
+    scope_devices: parseIdList(inv.scope_devices),
+    unscoped: parseIdList(inv.scope_rooms).length === 0 && parseIdList(inv.scope_devices).length === 0,
+    expires_at: inv.expires_at
   }
 }
 
@@ -433,13 +570,15 @@ function permSummary(role, extra) {
 function seedFamily() {
   if (stmts.allMembers.all().length > 0) return
   const at = new Date().toISOString()
-  const owner = stmts.insertMember.run('我（户主）', '', 'owner', '[]', 'active',
+  const owner = stmts.insertMember.run('我（户主）', '', 'owner', '[]', '[]', '[]', 'active',
     'owner-demo-token', null, at, at)
   const ownerId = Number(owner.lastInsertRowid)
-  const add = (name, relation, role, perms, status, joinedOffsetH) => {
+  const add = (name, relation, role, perms, scope, status, joinedOffsetH) => {
     const invited = new Date(Date.now() - (joinedOffsetH + 24) * 3600_000).toISOString()
     const joined = new Date(Date.now() - joinedOffsetH * 3600_000).toISOString()
+    const [rooms = [], devices = []] = scope || []
     const r = stmts.insertMember.run(name, relation, role, JSON.stringify(validPerms(perms)),
+      JSON.stringify(validIdList(rooms)), JSON.stringify(validIdList(devices)),
       status, status === 'active' ? token() : null, ownerId, invited, status === 'active' ? joined : null)
     const id = Number(r.lastInsertRowid)
     if (status === 'revoked') {
@@ -447,18 +586,21 @@ function seedFamily() {
     }
     return id
   }
-  add('妈妈', '家人', 'admin', [], 'active', 200)
-  add('爷爷', '家人', 'member', [], 'active', 120)
-  add('小宇', '孩子', 'member', [], 'active', 72)
-  // 访客默认仅场景执行；再显式授予设备控制，演示「角色默认 + 自定义勾选」
-  add('王阿姨', '钟点工', 'guest', ['device_control'], 'active', 8)
-  add('李师傅', '维修工', 'guest', [], 'revoked', 26)
+  add('妈妈', '家人', 'admin', [], null, 'active', 200)
+  // 爷爷：仅可操作卧室（room_id=2）设备、处理其定额/工单
+  add('爷爷', '家人', 'member', [], [[2], []], 'active', 120)
+  // 小宇：卧室 + 书房（room_id=2,4）
+  add('小宇', '孩子', 'member', [], [[2, 4], []], 'active', 72)
+  // 访客王阿姨：钟点工，默认仅场景执行 + 显式设备控制，操作范围限厨房房间（3）与客厅主灯（id=1，演示设备授权跟随换房）
+  add('王阿姨', '钟点工', 'guest', ['device_control'], [[3], [1]], 'active', 8)
+  add('李师傅', '维修工', 'guest', [], null, 'revoked', 26)
 
   // 一条待接受邀请 + 一条已取消邀请，演示邀请状态机
   const exp = new Date(Date.now() + 3 * 24 * 3600_000).toISOString()
   stmts.insertInvite.run('GUEST2026', '访客小陈', '朋友', 'guest',
-    JSON.stringify(['device_control']), exp, ownerId, new Date(Date.now() - 5 * 3600_000).toISOString())
-  const old = stmts.insertInvite.run('OLDLABEL1', '访客老赵', '朋友', 'guest', '[]',
+    JSON.stringify(['device_control']), JSON.stringify([3]), JSON.stringify([]),
+    exp, ownerId, new Date(Date.now() - 5 * 3600_000).toISOString())
+  const old = stmts.insertInvite.run('OLDLABEL1', '访客老赵', '朋友', 'guest', '[]', '[]', '[]',
     new Date(Date.now() - 8 * 86400_000).toISOString(), ownerId,
     new Date(Date.now() - 9 * 86400_000).toISOString())
   stmts.cancelInvite.run('来访计划取消（演示）', old.lastInsertRowid)

@@ -2,6 +2,7 @@
   <div class="scenes">
     <div v-if="!store.current" class="lock-banner">🔒 浏览模式：访客/成员加入家庭后可触发场景，场景编排需「场景管理」权限。</div>
     <div v-else-if="!canRun" class="lock-banner">🔒 当前角色没有场景执行权限，仅可查看场景。</div>
+    <div v-else-if="!store.isUnscoped()" class="lock-banner scope-banner">🧭 操作范围：{{ store.scopeLabel(store.currentMember) }}；含范围外设备的场景不可触发，编排时只能选择授权设备。</div>
     <div class="toolbar">
       <button class="add" :disabled="!canManage" :title="canManage?'':'无场景管理权限'" @click="canManage && (showBuilder = !showBuilder)">＋ 新建场景</button>
     </div>
@@ -13,12 +14,12 @@
       <p class="hint">为场景添加「设备 → 动作」步骤：</p>
       <div class="step" v-for="(s,i) in sceneForm.actions" :key="i">
         <select v-model="s.device_id">
-          <option v-for="d in store.devices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}</option>
+          <option v-for="d in buildableDevices" :key="d.id" :value="d.id">{{ d.type_icon }} {{ d.name }}</option>
         </select>
         <select v-model="s.action"><option>开启</option><option>关闭</option><option>调节亮度</option><option>布防</option><option>启动</option></select>
         <button type="button" class="rm" @click="sceneForm.actions.splice(i,1)">✕</button>
       </div>
-      <button type="button" class="ghost" @click="sceneForm.actions.push({device_id:store.devices[0]?.id??null,action:'开启'})">＋ 添加步骤</button>
+      <button type="button" class="ghost" @click="sceneForm.actions.push({device_id:buildableDevices[0]?.id??null,action:'开启'})">＋ 添加步骤</button>
       <div class="btns">
         <button type="submit" class="save">保存场景</button>
         <button type="button" class="ghost" @click="showBuilder=false">取消</button>
@@ -45,14 +46,17 @@
           <span class="badge" :class="s.enabled?'on':'off'">{{ s.enabled?'已启用':'已停用' }}</span>
         </div>
         <div class="actions">
-          <div v-for="a in s.actions" :key="a.id" class="act-chip" :class="{invalid:!a.device_name}">
-            <span class="k">{{ a.device_name || a.device_key || '未知设备' }}<em v-if="!a.device_name">{{ a.unresolved === 'duplicate' ? '重名·待重新绑定' : '已删除' }}</em></span>
+          <div v-for="a in s.actions" :key="a.id" class="act-chip"
+               :class="{invalid:!a.device_name, out: a.device_name && !actionInScope(a)}">
+            <span class="k">{{ a.device_name || a.device_key || '未知设备' }}<em v-if="!a.device_name">{{ a.unresolved === 'duplicate' ? '重名·待重新绑定' : '已删除' }}</em><em v-else-if="!actionInScope(a)" class="lk">🔒范围外</em></span>
             <span class="v">{{ a.action }}</span>
           </div>
           <span v-if="!s.actions.length" class="noact">无动作</span>
         </div>
         <div class="btns">
-          <button class="run" :disabled="!s.enabled || !canRun" :title="canRun?'':'无场景执行权限'" @click="canRun && run(s)">▶ 触发</button>
+          <button class="run" :disabled="!s.enabled || !canRun || !sceneInScope(s)"
+                  :title="!canRun ? '无场景执行权限' : (!sceneInScope(s) ? '场景包含操作范围外的设备（后端将拒绝执行）' : '')"
+                  @click="canRun && sceneInScope(s) && run(s)">▶ 触发</button>
           <button v-if="canManage" class="ghost" @click="store.toggleScene(s.id)">{{ s.enabled?'停用':'启用' }}</button>
           <button v-if="canManage" class="ghost del" @click="remove(s)">删除</button>
         </div>
@@ -71,6 +75,22 @@ const canManage = computed(() => store.can('scene_manage'))
 const showBuilder = ref(false)
 const sceneForm = ref({ name: '', actions: [] })
 const lastResult = ref(null)
+
+// 编排可选设备：全屋身份全部；限定身份只列授权范围内设备（与后端创建校验一致）
+const buildableDevices = computed(() =>
+  store.current && store.isUnscoped() ? store.devices : store.devices.filter((d) => store.canAccessDevice(d)))
+// 已绑定动作设备是否在范围内（未绑定的失效引用不算越权，执行时逐项跳过）
+function actionInScope(a) {
+  if (!store.current) return true
+  if (store.isUnscoped()) return true
+  if (!a.device_name) return true
+  const d = store.devices.find((x) => x.id === a.device_id)
+  return d ? store.canAccessDevice(d) : true
+}
+function sceneInScope(s) {
+  if (!store.current || store.isUnscoped()) return true
+  return s.actions.every(actionInScope)
+}
 
 function create() {
   const actions = sceneForm.value.actions.filter((a) => a.device_id != null)
@@ -91,6 +111,9 @@ async function remove(s) {
 <style scoped>
 .scenes{display:flex;flex-direction:column;gap:12px;}
 .lock-banner{background:#3a2f12;border:1px solid rgba(255,213,79,.35);color:#ffd54f;font-size:12px;border-radius:10px;padding:9px 14px;}
+.lock-banner.scope-banner{background:#10233f;border-color:rgba(66,165,245,.4);color:#80deea;}
+.act-chip.out{border-color:rgba(128,222,234,.5);}
+.act-chip.out .k em.lk{color:#80deea;font-style:normal;}
 .toolbar button{font-family:inherit;background:linear-gradient(135deg,#43a047,#2e7d32);border:none;color:#fff;border-radius:8px;padding:9px 14px;font-size:13px;font-weight:600;cursor:pointer;}
 .builder{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px;}
 .builder h4{margin:0;color:#fff;}

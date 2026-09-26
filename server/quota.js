@@ -508,7 +508,7 @@ export function deleteQuota(id, reason = '') {
 const BATCH_ACTIONS = ['create', 'update', 'enable', 'disable', 'delete']
 const BATCH_LIMIT = 100
 
-export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh, enabled, reason = '' }) {
+export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh, enabled, reason = '' }, authorize = null) {
   if (!BATCH_ACTIONS.includes(action)) throw new Error('批量操作类型无效')
   // 共享参数先整体校验：额度/周期非法时整批拒绝（400），而不是逐项报同一错误
   if (action === 'create' || (action === 'update' && limit_kwh != null && limit_kwh !== '')) {
@@ -545,11 +545,14 @@ export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh,
       if (it.kind === 'create') {
         const label = targetLabel(it.target)
         try {
+          // 细粒度范围逐项授权：越权单项标记失败、不拖垮整批（与重复定额等冲突同一出口）
+          if (authorize && !authorize({ scope: it.target.scope, room_id: Number(it.target.room_id), device_id: Number(it.target.device_id), label }))
+            throw Object.assign(new Error('超出操作范围（房间/设备未授权）'), { noScope: true })
           const id = createQuotaRaw({ ...it.target, period, limit_kwh, reason }, at)
           const q = stmts.quotaById.get(id)
           results.push({ ok: true, label, action, quota_id: id, message: `已创建 ${PERIOD_LABEL[q.period]} ${q.limit_kwh}kWh` })
         } catch (e) {
-          results.push({ ok: false, label, action, message: e.message })
+          results.push({ ok: false, label, action, message: e.message, no_scope: !!e.noScope })
         }
         continue
       }
@@ -557,6 +560,8 @@ export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh,
       const label = q ? `${q.scope === 'room' ? '房间' : '设备'}·${q.target_name}` : `定额#${it.quotaId}`
       try {
         if (!q) throw new Error('定额不存在')
+        if (authorize && !authorize(q))
+          throw Object.assign(new Error('超出操作范围（房间/设备未授权）'), { noScope: true })
         if (it.kind === 'delete') {
           deleteQuotaRaw(q.id, reason, at)
           results.push({ ok: true, label, action, quota_id: q.id, message: '已删除，未关闭告警自动解除' })
@@ -585,7 +590,7 @@ export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh,
           }
         }
       } catch (e) {
-        results.push({ ok: false, label, action, quota_id: q?.id ?? it.quotaId, message: e.message })
+        results.push({ ok: false, label, action, quota_id: q?.id ?? it.quotaId, message: e.message, no_scope: !!e.noScope })
       }
     }
     db.exec('COMMIT')

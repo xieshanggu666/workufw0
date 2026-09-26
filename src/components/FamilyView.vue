@@ -18,6 +18,9 @@
         </div>
         <div class="perm-chips">
           <i v-for="p in (currentMember?.effective_perms || [])" :key="p" class="perm">{{ shortPerm(p) }}</i>
+          <i v-if="currentMember" class="perm scope" :class="{house: currentMember.unscoped}">
+            🧭 {{ store.scopeLabel(currentMember) }}
+          </i>
         </div>
       </div>
       <div class="id-ops">
@@ -57,7 +60,7 @@
           </div>
         </div>
       </div>
-      <p class="sub">角色默认权限之外可在「编辑成员 / 创建邀请」时逐项追加自定义授权；户主拥有全部权限且不可撤销，管理员只能管理成员与访客（不能管管理员/户主）。</p>
+      <p class="sub">角色默认权限之外可在「编辑成员 / 创建邀请」时逐项追加自定义授权，并可按<b>房间 / 设备</b>限定操作范围（设备授权换房自动跟随、房间授权按设备当前房间判定，邀请/续邀/撤销同步生效）；户主拥有全部权限且不可撤销，管理员只能管理成员与访客。</p>
     </div>
 
     <!-- 邀请与成员管理（需 member_manage 权限；无权时只读展示） -->
@@ -75,6 +78,24 @@
           <select v-model="inviteForm.role">
             <option v-for="r in invitableRoles" :key="r.key" :value="r.key">{{ r.label }}</option>
           </select>
+          <div class="scope-pick">
+            <span class="pp-title">
+              操作范围（不勾选=全屋；勾选后设备控制 / 场景执行 / 定额 / 工单仅对授权房间与设备生效）：
+            </span>
+            <div v-if="inviteForm.role === 'owner'" class="dim">户主拥有全屋权限，不可限定。</div>
+            <div v-else class="scope-grid">
+              <div v-for="r in store.rooms" :key="'r'+r.id" class="scope-group">
+                <label class="room-pick">
+                  <input type="checkbox" :value="r.id" v-model="inviteForm.scope_rooms" />
+                  🚪 {{ r.name }}
+                </label>
+                <label v-for="d in devicesByRoom(r.id)" :key="d.id" class="dev-pick">
+                  <input type="checkbox" :value="d.id" v-model="inviteForm.scope_devices" />
+                  {{ d.type_icon }} {{ d.name }}
+                </label>
+              </div>
+            </div>
+          </div>
           <div class="perm-pick">
             <span class="pp-title">在角色默认之外追加授权：</span>
             <label v-for="p in allPermKeys" :key="p" :class="{off: isDefaultPerm(inviteForm.role, p)}">
@@ -88,7 +109,7 @@
 
         <table v-if="store.family.invites.length">
           <thead><tr>
-            <th>受邀人</th><th>角色</th><th>追加授权</th><th>邀请码</th><th>状态</th><th>有效期/时间</th><th>操作</th>
+            <th>受邀人</th><th>角色</th><th>追加授权</th><th>操作范围</th><th>邀请码</th><th>状态</th><th>有效期/时间</th><th>操作</th>
           </tr></thead>
           <tbody>
             <tr v-for="i in store.family.invites" :key="i.id" :class="{dead: i.status !== 'pending'}">
@@ -98,6 +119,7 @@
                 <span v-if="i.perms.length" class="perm-list">{{ i.perms.map(shortPerm).join('、') }}</span>
                 <span v-else class="dim">默认</span>
               </td>
+              <td><span class="scope-text" :class="{house: i.unscoped}">{{ inviteScopeText(i) }}</span></td>
               <td><code :class="{soon: i.expired}">{{ i.code }}</code></td>
               <td>
                 <span class="inv-st" :class="i.status">{{ i.status_label }}</span>
@@ -140,6 +162,9 @@
                   <i v-for="p in m.effective_perms" :key="p" class="perm">{{ shortPerm(p) }}</i>
                   <i v-if="!m.effective_perms.length" class="perm none">仅浏览</i>
                 </div>
+                <div class="scope-line" :class="{house: m.unscoped}">
+                  <b>操作范围</b> {{ store.scopeLabel(m) }}
+                </div>
               </div>
               <div class="m-ops">
                 <template v-if="m.role !== 'owner' && canEdit(m)">
@@ -159,6 +184,23 @@
               <select v-model="editForm.role" @change="onEditRoleChange">
                 <option v-for="r in editableRoles(m)" :key="r.key" :value="r.key">{{ r.label }}</option>
               </select>
+              <div class="scope-pick">
+                <span class="pp-title">
+                  操作范围（不勾选=全屋；房间授权按设备当前所在房间生效，设备授权换房自动跟随）：
+                </span>
+                <div class="scope-grid">
+                  <div v-for="r in store.rooms" :key="'er'+r.id" class="scope-group">
+                    <label class="room-pick">
+                      <input type="checkbox" :value="r.id" v-model="editForm.scope_rooms" />
+                      🚪 {{ r.name }}
+                    </label>
+                    <label v-for="d in devicesByRoom(r.id)" :key="'ed'+d.id" class="dev-pick">
+                      <input type="checkbox" :value="d.id" v-model="editForm.scope_devices" />
+                      {{ d.type_icon }} {{ d.name }}
+                    </label>
+                  </div>
+                </div>
+              </div>
               <div class="perm-pick">
                 <label v-for="p in allPermKeys" :key="p" :class="{off: isDefaultPerm(editForm.role, p)}">
                   <input type="checkbox" :checked="isDefaultPerm(editForm.role, p) || editForm.perms.includes(p)"
@@ -190,6 +232,9 @@
                 <span class="st" :class="m.status">{{ m.status_label }}</span>
               </span>
               <div class="perm-chips"><i v-for="p in m.effective_perms" :key="p" class="perm">{{ shortPerm(p) }}</i></div>
+              <div class="scope-line" :class="{house: m.unscoped}">
+                <b>操作范围</b> {{ store.scopeLabel(m) }}
+              </div>
             </div>
           </div>
         </div>
@@ -211,6 +256,7 @@
           <div class="perm-chips">
             <i v-for="p in joinEffectivePerms" :key="p" class="perm">{{ shortPerm(p) }}</i>
           </div>
+          <p class="pv-scope"><b>操作范围：</b>{{ joinScopeText }}</p>
           <p class="dim">有效期至 {{ fmtTime(joinPreview.expires_at) }}</p>
         </div>
         <p v-if="joinError" class="err">{{ joinError }}</p>
@@ -278,15 +324,24 @@ function onSwitchId(e) {
 }
 
 // ===== 创建邀请 =====
-const emptyInviteForm = () => ({ show: false, name: '', relation: '', role: 'guest', perms: [] })
+const emptyInviteForm = () => ({ show: false, name: '', relation: '', role: 'guest', perms: [], scope_rooms: [], scope_devices: [] })
 const inviteForm = ref(emptyInviteForm())
 function openInviteForm() {
   inviteForm.value = { ...emptyInviteForm(), show: true, role: 'member' }
 }
+// 按房间分组设备（范围选择器）
+function devicesByRoom(roomId) {
+  return store.devices.filter((d) => d.room_id === roomId)
+}
+// 邀请表格中的范围摘要
+function inviteScopeText(i) {
+  return store.scopeLabel(i)
+}
 async function submitInvite() {
   const inv = await store.createInvite({
     name: inviteForm.value.name, relation: inviteForm.value.relation,
-    role: inviteForm.value.role, perms: inviteForm.value.perms
+    role: inviteForm.value.role, perms: inviteForm.value.perms,
+    scope_rooms: inviteForm.value.scope_rooms, scope_devices: inviteForm.value.scope_devices
   })
   if (inv) inviteForm.value.show = false
 }
@@ -303,14 +358,16 @@ function copyCode(code) {
 
 // ===== 编辑成员 =====
 const editId = ref(null)
-const editForm = ref({ name: '', relation: '', role: 'member', perms: [] })
+const editForm = ref({ name: '', relation: '', role: 'member', perms: [], scope_rooms: [], scope_devices: [] })
 function toggleEdit(m) {
   if (editId.value === m.id) { editId.value = null; return }
   editId.value = m.id
   editForm.value = {
     name: m.name, relation: m.relation, role: m.role,
     // 勾选框的额外项 = 实际权限 − 角色默认
-    perms: m.effective_perms.filter((p) => !isDefaultPerm(m.role, p))
+    perms: m.effective_perms.filter((p) => !isDefaultPerm(m.role, p)),
+    scope_rooms: [...(m.scope_rooms || [])],
+    scope_devices: [...(m.scope_devices || [])]
   }
 }
 function onEditRoleChange() {
@@ -325,7 +382,8 @@ function toggleEditPerm(p, checked) {
 async function submitEdit(m) {
   const ok = await store.updateMember(m.id, {
     name: editForm.value.name, relation: editForm.value.relation,
-    role: editForm.value.role, perms: editForm.value.perms
+    role: editForm.value.role, perms: editForm.value.perms,
+    scope_rooms: editForm.value.scope_rooms, scope_devices: editForm.value.scope_devices
   })
   if (ok) editId.value = null
 }
@@ -343,6 +401,10 @@ const joinError = ref('')
 const joinEffectivePerms = computed(() => {
   if (!joinPreview.value) return []
   return [...new Set([...(store.family.roles[joinPreview.value.role]?.default_perms || []), ...joinPreview.value.perms])]
+})
+const joinScopeText = computed(() => {
+  if (!joinPreview.value) return ''
+  return store.scopeLabel(joinPreview.value)
 })
 async function doPreview() {
   joinError.value = ''; joinPreview.value = null
@@ -414,6 +476,23 @@ select,input,button{font-family:inherit;background:#13233f;border:1px solid rgba
 .perm-pick label{font-size:11px;color:#dbe4f3;display:flex;align-items:center;gap:4px;cursor:pointer;}
 .perm-pick label.off{opacity:.4;}
 .perm-pick input{width:auto;padding:0;}
+/* 房间/设备操作范围选择器 */
+.scope-pick{flex-basis:100%;background:#0a1529;border:1px dashed rgba(120,160,220,0.25);border-radius:8px;padding:9px 10px;}
+.scope-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 14px;margin-top:6px;max-height:170px;overflow:auto;}
+.scope-group{display:flex;flex-direction:column;gap:3px;border-left:2px solid rgba(120,160,220,0.25);padding-left:8px;}
+.room-pick{font-size:12px;color:#90caf9!important;font-weight:600;cursor:pointer;}
+.dev-pick{font-size:11px;color:#a8bdd8!important;padding-left:12px;cursor:pointer;}
+.scope-pick input{width:auto;padding:0;margin-right:4px;}
+.scope-line{font-size:10px;color:#7e93b8;margin-top:4px;}
+.scope-line b{color:#90caf9;font-weight:600;margin-right:4px;}
+.scope-line.house{color:#a5d6a7;}
+.scope-line.house b{color:#a5d6a7;}
+.scope-text{font-size:10px;color:#7e93b8;line-height:1.5;}
+.scope-text.house{color:#a5d6a7;}
+.perm.scope{background:#102540;color:#80deea;border-color:rgba(128,222,234,.3);}
+.perm.scope.house{background:#12291c;color:#a5d6a7;border-color:rgba(165,214,167,.3);}
+.pv-scope{font-size:12px!important;color:#80deea!important;}
+.pv-scope b{color:#90caf9;}
 /* 表格 */
 table{width:100%;border-collapse:collapse;font-size:12px;}
 th,td{padding:8px 10px;text-align:left;border-bottom:1px solid rgba(120,160,220,0.1);vertical-align:middle;}
